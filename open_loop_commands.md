@@ -90,4 +90,129 @@ actuator_test
 For live joint *position* rather than just the commanded value, subscribe to
 `/world/default/dynamic_pose/info` and diff a link's orientation quaternion
 against a known baseline — there's no direct "current joint angle" topic
-exposed by gz-sim for this setup.
+exposed by gz-sim for this setup. (Update: for the bench-test model below, a
+`gz-sim-joint-state-publisher-system` plugin gives a much simpler path to the
+same data — see the next section.)
+
+## Servo load test under motor thrust
+
+Fold/tilt servos had only been exercised in isolation (motors off). This
+section validates the `JointPositionController` gain
+(`p_gain`/`i_gain`/`d_gain` in `model.sdf`) against gyroscopic/aerodynamic
+load from spinning motors, since the eventual `ActuatorEffectivenessFoldrotor`
+wrench allocator assumes commanded tilt angle ≈ actual tilt angle.
+
+### Bench-test fixture
+
+Spinning both motors at a nontrivial throttle on the untethered `foldrotor3`
+model risks a tumble (real thrust at even moderate `-v` exceeds the
+airframe's own weight — see the Motors section above, and this has already
+crashed gz-sim once from an ODE collision-bounds overflow). To test under
+load safely, `Tools/simulation/gz/models/foldrotor3_bench/model.sdf` is a
+copy of the flight `model.sdf` with two additions (**not** present in the
+flight file):
+
+- `<joint name='bench_mount_joint' type='fixed'><parent>world</parent>
+  <child>base_link</child></joint>` — rigidly bolts `base_link` (and,
+  transitively, `airframe_link`) to the world. All prop/fold/tilt revolute
+  joints stay free; only the airframe body is pinned, so it cannot tumble
+  regardless of thrust.
+- A `gz-sim-joint-state-publisher-system` plugin listing the four fold/tilt
+  joints, publishing actual joint angle/velocity on
+  `/world/<world>/model/<model>/joint_state` (a `gz.msgs.Model` message,
+  one `joint { axis1 { position: ... velocity: ... } }` block per joint).
+  This is a much more direct way to read back actual angle than the
+  dynamic_pose/info quaternion-diffing described above, and only needed for
+  this bench rig since the flight model has no such readback.
+
+It reuses the flight model's meshes via `model://foldrotor3/meshes/...`
+(resolved because both model directories sit on the same
+`GZ_SIM_RESOURCE_PATH`), so nothing needed duplicating there.
+
+### Launching the bench rig
+
+`PX4_SYS_AUTOSTART=4026` bypasses the `PX4_SIM_MODEL` -> airframe-filename
+lookup in `rcS`, so `PX4_SIM_MODEL` can point at `gz_foldrotor3_bench` (no
+matching airframe file exists, or needs to) while still loading airframe
+4026's params. This is what `make px4_sitl gz_foldrotor3` does under the
+hood (see `src/modules/simulation/gz_bridge/CMakeLists.txt`), just with an
+explicit model name instead of a generated make target:
+
+```
+servo_load_test_logs/launch_bench.sh [work_dir] [gz_model]
+# defaults: work_dir=/tmp/foldrotor3_bench_test, gz_model=gz_foldrotor3_bench
+```
+
+This blocks in the foreground, feeding `pxh>` from `$work_dir/pxh_in` (a
+FIFO) and logging to `$work_dir/px4.log`. Drive it from another shell:
+
+```
+echo 'actuator_test set -s 2 -v 0.5 -t 6' > /tmp/foldrotor3_bench_test/pxh_in
+```
+
+`actuator_test set ... -t N` is non-blocking — it schedules an internal
+revert-to-off after N seconds and returns the prompt immediately, so
+multiple commands (e.g. both motors, then a servo step) can be queued in
+quick succession to run concurrently.
+
+Capture the joint_state topic for the test window and extract one joint's
+`axis1.position` to CSV:
+
+```
+gz topic --echo -t /world/default/model/foldrotor3_bench_0/joint_state \
+    --duration 10 > capture.log
+python3 servo_load_test_logs/parse_joint_state.py capture.log Arm1TiltJoint out.csv
+python3 servo_load_test_logs/analyze.py out.csv <commanded_rad>
+```
+
+`analyze.py` reports step-onset time, peak/overshoot, 5%-band settling time,
+and steady-state mean/error/oscillation (peak-to-peak over the last 1s).
+
+### Test and results
+
+Servo2 (`Arm1TiltJoint`) commanded to `-v 0.5` (+22.63 deg / 0.395 rad) via
+`actuator_test`, motors either off or spun up ~1.5s beforehand (RPM settles
+in <0.1s given `timeConstantUp=0.0125s`, well before the servo step) and
+held for the rest of the window:
+
+| condition | steady-state error | oscillation (pk-pk) | settling time | overshoot |
+|---|---|---|---|---|
+| motors off, p_gain=10 | +0.21 deg | 0.00 deg | 0.16 s | +0.21 deg |
+| motors on, `-v 0.3` (~23N combined, ~2.7x weight), p_gain=10 | +0.21 deg | 0.46 deg | 0.16 s | +0.43 deg |
+| motors on, `-v 0.6` (~32N combined, ~3.8x weight), p_gain=10 | +0.20 deg | 0.78 deg | 0.19 s | +0.59 deg |
+| motors on, `-v 0.6`, p_gain=10, **d_gain=1.0** | **-9.3 deg** | **1.65 deg** | never | (unstable) |
+| motors on, `-v 0.6`, **p_gain=20**, d_gain=0.5 (final) | +0.10 deg | 0.00 deg | 0.08 s | +0.10 deg |
+
+Steady-state error was essentially unaffected by motor load at the default
+gain (+0.2 deg either way) — the load instead showed up as a small
+motor-vibration-driven limit cycle riding on top of the held position
+(0 → 0.78 deg pk-pk from 0 to ~69% commanded rotor speed), plus weaker
+cross-coupling onto the fold axis (`Arm1FoldJoint`, commanded to hold 0 deg):
+0.26 deg pk-pk at `-v 0.3`.
+
+**Raising `d_gain` made this worse, not better.** At `d_gain=1.0` under
+`-v 0.6` load, differentiating the vibration-frequency noise apparently
+saturated the position controller's `cmd_max=5` effort limit: the joint
+settled into a sustained ~60Hz limit cycle around a mean ~9 deg away from
+the command, never converging. Raw data:
+`servo_load_test_logs/04_motorson_v0.6_tilt_pgain10_dgain1.0_FAILED.csv`.
+More damping is the wrong direction for a high-frequency vibration
+disturbance like this one.
+
+**Raising `p_gain` to 20 (leaving `d_gain=0.5`) fixed it instead**: the
+limit cycle disappeared entirely (0.00 deg pk-pk on both the tilt and the
+cross-coupled fold joint at the worst-throttle case tested), steady-state
+error dropped to +0.10 deg, and it settled faster with less overshoot than
+even the original motors-off case. Verified this didn't regress the
+motors-off case (peak/overshoot unchanged at +0.10 deg) and that the flight
+`foldrotor3` model still spawns and responds to servo commands cleanly with
+the new gain (motors off, untethered — not load-tested untethered, for the
+tumble-risk reasons above).
+
+**`p_gain=20` (d_gain/i_gain/cmd_max/cmd_min unchanged) has been applied to
+all four servo plugins in the committed `model.sdf`** (and to
+`foldrotor3_bench/model.sdf`, so the bench rig stays representative of the
+flight file). Rationale is recorded in-line in `model.sdf`'s plugin comment.
+
+Raw per-run CSVs (time, position, velocity) and the scripts above are in
+`servo_load_test_logs/`.
