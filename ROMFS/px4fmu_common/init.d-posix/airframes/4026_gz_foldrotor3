@@ -30,11 +30,34 @@ param set-default CA_ROTOR1_KM -0.05
 param set-default SIM_GZ_EC_FUNC1 101
 param set-default SIM_GZ_EC_FUNC2 102
 
-param set-default SIM_GZ_EC_MIN1 150
-param set-default SIM_GZ_EC_MIN2 150
+# PX4 publishes this raw MIN..MAX-scaled value straight through as the
+# commanded rad/s with no further conversion, so MAX must equal model.sdf's
+# maxRotVelocity (2054.42, from the real T-Motor F90 KV1300 + HQ 70403 test
+# data) for 100% throttle to reach it -- SIM_GZ_EC_MAX is an int32 param, so
+# rounded to 2054. MIN kept at the same ~15% idle-floor fraction as before.
+param set-default SIM_GZ_EC_MIN1 308
+param set-default SIM_GZ_EC_MIN2 308
 
-param set-default SIM_GZ_EC_MAX1 1000
-param set-default SIM_GZ_EC_MAX2 1000
+param set-default SIM_GZ_EC_MAX1 2054
+param set-default SIM_GZ_EC_MAX2 2054
+
+# Fold/tilt servos, open-loop via actuator_test -s <n>:
+#   Servo1 (n=1) -> Arm1FoldJoint   Servo2 (n=2) -> Arm1TiltJoint
+#   Servo3 (n=3) -> Arm2FoldJoint   Servo4 (n=4) -> Arm2TiltJoint
+# Angle range matches the +-0.79 rad joint limit in model.sdf.
+param set-default SIM_GZ_SV_FUNC1 201
+param set-default SIM_GZ_SV_FUNC2 202
+param set-default SIM_GZ_SV_FUNC3 203
+param set-default SIM_GZ_SV_FUNC4 204
+
+param set-default SIM_GZ_SV_MINA1 -45.26
+param set-default SIM_GZ_SV_MAXA1 45.26
+param set-default SIM_GZ_SV_MINA2 -45.26
+param set-default SIM_GZ_SV_MAXA2 45.26
+param set-default SIM_GZ_SV_MINA3 -45.26
+param set-default SIM_GZ_SV_MAXA3 45.26
+param set-default SIM_GZ_SV_MINA4 -45.26
+param set-default SIM_GZ_SV_MAXA4 45.26
 
 param set-default MPC_THR_HOVER 0.6
 param set-default NAV_DLL_ACT 2
