@@ -1,5 +1,11 @@
 # Controller Specification
 
+## Status
+**Not yet implemented in PX4.** As of the 2026-08-27 audit, no
+standalone foldrotor controller module exists in `src/`. This spec is
+the contract to build against, not a description of existing code. The
+reference implementation is the Simulink model.
+
 ## Scope
 Position + attitude control law. Algorithm reference: the validated
 Simulink model is the source of truth for the math. This spec covers the
