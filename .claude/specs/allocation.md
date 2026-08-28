@@ -1,5 +1,31 @@
 # Control Allocation Specification
 
+## Status
+**Not yet implemented in PX4.** No standalone allocator module exists in
+`src/` (confirmed 2026-08-27; `grep -rli foldrotor src/` returns nothing).
+`src/modules/mc_raptor` exists in this tree but is an unrelated RL-policy
+flight-mode module — don't mistake it for this target. Everything
+committed for foldrotor3 so far is simulation-side only:
+`Tools/simulation/gz/models/foldrotor3` (Gazebo model) and its
+`foldrotor3_bench` bench-test fixture variant, plus the
+`4026_gz_foldrotor3` PX4 airframe.
+
+The current airframe uses `CA_AIRFRAME 0` (PX4's generic/stock multirotor
+allocator), not this custom allocator — an explicit, self-documented
+open-loop first pass ("Open-loop first pass: default/generic control
+allocation only, no custom ActuatorEffectivenessFoldrotor. Actuators are
+driven directly via actuator_test, not through the control allocator's
+mixer output.") This is consistent with, not a violation of, this spec's
+"not to be replaced by PX4's default allocator" requirement, which applies
+once the custom module exists.
+
+**Actuator surface reachability (resolved 2026-08-28, PR #3):** the four
+fold/tilt servo joints (`servo_0..3`) had no PX4 actuator function
+assigned (`SIM_GZ_SV_FUNC*` unset), so `GZMixingInterfaceServo` wasn't
+publishing to them — blocking 4 of the 6 DOF this allocator will need to
+drive. `SIM_GZ_SV_FUNC1..4` are now set (201-204); see `system.md`
+Milestone 1 checklist.
+
 ## Scope
 Custom allocation, first-class subsystem. Not to be replaced by PX4's
 default allocator.
@@ -24,7 +50,10 @@ output; fix specified there). Moment components are already body-frame.
   matches how Gazebo's rotor plugin computes drag torque, or document
   the expected discrepancy. This is exactly the kind of assumption that
   lets controller and physics each be individually "correct" while
-  disagreeing at the boundary.
+  disagreeing at the boundary. **Known current gap:** `model.sdf`'s
+  drag/rolling-moment/spin-up-lag terms are x500-derived generic
+  placeholders, not measured for this vehicle, so this cross-check can't
+  be done precisely yet — matters at validation, not now.
 - Singularity handling is currently "avoid it by construction" (fixed
   α=β=0, so M0 stays full rank by design), not "detect and regularize
   at runtime" — Minv is a precomputed literal, not an on-line
@@ -56,6 +85,11 @@ constants):
   tolerance, for wrenches inside the unsaturated envelope. Checked
   algebraically here — the atan2 inverse and sin/cos forward mapping
   are consistent with each other — but nothing encodes this as a test.
+
+`open_loop_commands.md` (repo root) has the actuator_test channel map and
+reference commands for exercising all 6 channels via SITL — useful for
+the saturation/direction tests above once the allocator itself exists to
+compare against.
 
 ## Not specified here
 Actuator failure response, hardware-specific calibration (deferred —

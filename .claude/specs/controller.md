@@ -5,6 +5,8 @@
 standalone foldrotor controller module exists in `src/`. This spec is
 the contract to build against, not a description of existing code. The
 reference implementation is the Simulink model.
+(`src/modules/mc_raptor` exists in this tree but is an unrelated
+RL-policy flight-mode module — don't mistake it for this target.)
 
 ## Scope
 Position + attitude control law. Algorithm reference: the validated
