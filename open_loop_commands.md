@@ -84,7 +84,7 @@ gz topic -l | grep foldrotor3_0
 gz model -m foldrotor3_0 -j Prop1Joint
 
 # usage/help
-actuator_test
+c
 ```
 
 For live joint *position* rather than just the commanded value, subscribe to
