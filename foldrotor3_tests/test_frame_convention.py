@@ -15,9 +15,17 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-MODEL_DIR = (Path(__file__).resolve().parent.parent
-             / "Tools/simulation/gz/models/foldrotor3")
-MODEL_SDF = MODEL_DIR / "model.sdf"
+MODELS_DIR = (Path(__file__).resolve().parent.parent
+              / "Tools/simulation/gz/models")
+
+# Both files are exercised: foldrotor3_bench is a full textual duplicate of
+# the flight model (not an <include>), which is exactly how commit 00267a4's
+# arm-alignment fix landed in one and not the other. Running every assertion
+# against both is what stops that recurring.
+MODEL_SDFS = {
+    "flight": MODELS_DIR / "foldrotor3" / "model.sdf",
+    "bench": MODELS_DIR / "foldrotor3_bench" / "model.sdf",
+}
 
 FLU_TO_FRD = np.diag([1.0, -1.0, -1.0])
 
@@ -58,9 +66,8 @@ def _load_stl_vertices(path):
     return verts
 
 
-@pytest.fixture(scope="module")
-def model():
-    root = ET.parse(MODEL_SDF).getroot().find("model")
+def _frames_of(sdf_path):
+    root = ET.parse(sdf_path).getroot().find("model")
     frames = {}
     for element in list(root.findall("joint")) + list(root.findall("link")):
         pose = element.find("pose")
@@ -70,6 +77,11 @@ def model():
             frames[element.get("name")] = (pose.get("relative_to"),
                                            _pose_to_transform(pose.text))
     return root, frames
+
+
+@pytest.fixture(scope="module", params=sorted(MODEL_SDFS))
+def model(request):
+    return _frames_of(MODEL_SDFS[request.param])
 
 
 def _transform_to_body_flu(frames, name):
@@ -85,10 +97,21 @@ def _origin_frd(frames, name):
     return FLU_TO_FRD @ _transform_to_body_flu(frames, name)[:3, 3]
 
 
+def _resolve_mesh_uri(uri):
+    """model://<model>/meshes/<file> -> a path under MODELS_DIR.
+
+    The bench model reuses the flight model's meshes by URI rather than
+    duplicating them, so the mesh does not necessarily live beside the SDF
+    that references it.
+    """
+    stripped = uri.removeprefix("model://")
+    return MODELS_DIR / stripped
+
+
 def _mesh_bounds_frd(root, frames, link_name):
     link = next(x for x in root.findall("link") if x.get("name") == link_name)
     uri = link.find("visual").find(".//uri")
-    verts = _load_stl_vertices(MODEL_DIR / "meshes" / Path(uri.text).name)
+    verts = _load_stl_vertices(_resolve_mesh_uri(uri.text))
     transform = _transform_to_body_flu(frames, link_name)
     in_body = (transform[:3, :3] @ verts.T).T + transform[:3, 3]
     in_frd = (FLU_TO_FRD @ in_body.T).T
@@ -141,3 +164,76 @@ def test_cad_y_up_maps_to_body_up(model):
 
     assert cad_up[2] < -0.99, (
         f"model is not upright: CAD +Y maps to {cad_up} in body FRD")
+
+
+def test_bench_airframe_orientation_matches_flight():
+    """The bench fixture must carry the flight model's airframe alignment.
+
+    foldrotor3_bench/model.sdf is a copy, not an <include>, so a fix applied
+    to the flight file can silently miss it -- which is what happened to the
+    -90 deg yaw in commit 00267a4, leaving the bench arms on the wrong axis.
+    Compare the resolved rotations rather than the pose text so an equivalent
+    but differently-written pose still passes.
+    """
+    _, flight = _frames_of(MODEL_SDFS["flight"])
+    _, bench = _frames_of(MODEL_SDFS["bench"])
+
+    flight_r = _transform_to_body_flu(flight, "airframe_link")[:3, :3]
+    bench_r = _transform_to_body_flu(bench, "airframe_link")[:3, :3]
+
+    assert np.allclose(flight_r, bench_r, atol=1e-9), (
+        "bench airframe_link orientation has drifted from the flight model:\n"
+        f"flight=\n{flight_r}\nbench=\n{bench_r}")
+
+
+ROTORS = [("Prop1Link", "Prop1Joint"), ("Prop2Link", "Prop2Joint")]
+
+
+def _joint_axis(root, joint_name):
+    joint = next(j for j in root.findall("joint") if j.get("name") == joint_name)
+    axis = np.array([float(x) for x in joint.find("axis/xyz").text.split()])
+    return axis / np.linalg.norm(axis)
+
+
+@pytest.mark.parametrize("link,joint", ROTORS)
+def test_rotor_thrust_axis_is_the_spin_axis_and_points_up(model, link, joint):
+    """The rotor link's local +Z must be the spin axis, pointing up.
+
+    gz-sim-multicopter-motor-model-system applies thrust along the rotor
+    *link's* local Z (`AddWorldForce(R_link * (0,0,thrust))`), not along the
+    joint axis, and the thrust sign does not depend on turningDirection.
+    foldrotor3's CAD export is Y-up, so this was originally violated: the
+    rotor links' local Z lay in the horizontal plane, perpendicular to their
+    own spin axis. The thrust vector then rotated with the propeller and
+    averaged to zero -- measured net lift was 0.03 N against a 15.26 N
+    airframe weight. See .claude/specs/force_moment_test.md.
+    """
+    root, frames = model
+    rotation = _transform_to_body_flu(frames, link)[:3, :3]
+    thrust_axis = FLU_TO_FRD @ (rotation @ np.array([0.0, 0.0, 1.0]))
+    spin_axis = FLU_TO_FRD @ (rotation @ _joint_axis(root, joint))
+
+    assert np.allclose(thrust_axis, spin_axis, atol=1e-3), (
+        f"{link} thrust axis {thrust_axis} is not its spin axis {spin_axis}; "
+        "thrust will rotate with the propeller and average to zero")
+    assert thrust_axis[2] < -0.999, (
+        f"{link} thrust axis {thrust_axis} does not point up (body -Z in FRD)")
+
+
+def test_the_two_rotors_counter_rotate(model):
+    """Opposite turningDirection is what cancels yaw on this side-by-side pair.
+
+    It does not affect thrust direction (the two `turningDirection` factors in
+    the plugin's thrust expression cancel), only the drag-torque sign.
+    """
+    root, _ = model
+    directions = {}
+    for plugin in root.findall("plugin"):
+        if "multicopter-motor-model" in (plugin.get("filename") or ""):
+            directions[plugin.findtext("jointName").strip()] = \
+                plugin.findtext("turningDirection").strip()
+
+    assert set(directions) == {"Prop1Joint", "Prop2Joint"}, directions
+    assert directions["Prop1Joint"] != directions["Prop2Joint"], (
+        f"both rotors spin the same way ({directions}); yaw reactions will add "
+        "instead of cancelling")

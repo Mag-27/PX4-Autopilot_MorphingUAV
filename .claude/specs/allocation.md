@@ -37,12 +37,46 @@ confirmed inertial→body rotation is missing on the velocity-loop
 output; fix specified there). Moment components are already body-frame.
 **Out:** actuator_motors, actuator_servos commands
 
+## Actuator naming and tilt-limit convention (resolved 2026-09-06)
+
+Two gaps flagged in `findings.md` (2026-09-06, "Tilt/fold actuator limit
+conflict, and α/β→joint mapping is undocumented") are now settled by
+user decision — both are control-design calls, not derivable from SDF or
+code alone.
+
+**α/β ↔ physical joint identity — by design in the vehicle dynamics:**
+- α1, α2 = `Arm1FoldJoint`, `Arm2FoldJoint` angle
+- β1, β2 = `Arm1TiltJoint`, `Arm2TiltJoint` angle
+
+Combined with the 2026-09-06 SDF-geometry findings (unchanged, still
+correct — they described what each joint does, not what MATLAB calls it):
+α (fold) tilts thrust into body ±Y (lateral); β (tilt) tilts thrust into
+body ±X (longitudinal). Arms are angle-sign-symmetric, not mirrored:
+equal positive α on both arms tilts both thrust vectors the same
+direction in body frame, not a differential — any allocator logic
+assuming β₂ = −β₁-style mirroring must be checked against this.
+
+**Tilt limit — clamped to the physical range, ±45.26° (±0.79 rad):**
+the SDF joint limit and `SIM_GZ_SV_MINA/MAXA` are authoritative; the
+allocator's `max_tilt` is decided to be **0.79 rad, not 1.0472 rad**.
+The original ±60° figure was the allocator's design intent, not
+something the plant can reach — see `findings.md`'s PX4 servo-mixing
+trace for how a command beyond the physical limit gets silently
+saturated with no log, which is what makes this a "must fix before
+building," not a cosmetic mismatch. This reduces max thrust-vectoring
+authority versus the original 60° design; no SDF/hardware change is
+made or implied by this decision.
+
 ## Known requirements
 - Allocation matrix: constant, frozen at tilt angles α1 = α2 = 0,
   confirmed current — `Control_Alloc.m` and the forward `fcn` MATLAB
   Function block implement this directly
-- Actuator limits: F1, F2 ∈ [0, 15] N; α1, β1, α2, β2 ∈ [-60°, 60°]
-  (±1.0472 rad) — enforced by explicit clamping in `Control_Alloc`
+- **Actuator limits (updated 2026-09-06):** F1, F2 ∈ [0, 15] N; α1, β1,
+  α2, β2 ∈ **[-45.26°, 45.26°] (±0.79 rad)** — was ±60° (±1.0472 rad);
+  clamped to the physical/SDF/servo range per the decision above.
+  Enforced by explicit clamping in `Control_Alloc`; `max_tilt` must be
+  updated there when `Control_Alloc.m` is brought into this repo or
+  reimplemented for PX4.
 - Reactive drag torque is modeled as ∓k·(full rotor thrust vector), not
   just its nominal spin-axis (z) component — M0's moment rows apply k
   to each rotor's own-axis thrust component (e.g. k·Tx1 contributes to
@@ -85,6 +119,10 @@ constants):
   tolerance, for wrenches inside the unsaturated envelope. Checked
   algebraically here — the atan2 inverse and sin/cos forward mapping
   are consistent with each other — but nothing encodes this as a test.
+- **New, from the 2026-09-06 limit decision:** a test asserting the
+  allocator's own `max_tilt`/clamping constant equals 0.79 rad, not
+  1.0472 rad — catches this regressing if `Control_Alloc.m` is
+  re-imported from an older MATLAB revision.
 
 `open_loop_commands.md` (repo root) has the actuator_test channel map and
 reference commands for exercising all 6 channels via SITL — useful for

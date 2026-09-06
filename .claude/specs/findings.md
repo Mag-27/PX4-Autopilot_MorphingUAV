@@ -13,6 +13,79 @@ here — see `reference/`.
 
 ---
 
+## 2026-09-06 — Tilt/fold actuator limit conflict, and α/β→joint mapping is undocumented
+
+**Folded.** → `allocation.md` ("Actuator naming and tilt-limit
+convention", Known requirements) and `system.md` (Allocation→Actuators
+row, Sign convention and Valid range cells). Both gaps resolved by user
+decision 2026-09-06: tilt limit clamped to ±0.79 rad (±45.26°, the
+physical/SDF/servo range, not the allocator's original ±60° design
+intent); α1/α2 = Arm1/Arm2 **fold** angle, β1/β2 = Arm1/Arm2 **tilt**
+angle, by design in the vehicle dynamics. Detail (SDF pose-chain
+derivation, PX4 silent-saturation code path, arm angle-sign-symmetry
+trap) in git history.
+
+---
+
+## 2026-09-06 — Force/moment direction test PASSED; found and fixed a rotor thrust-axis defect
+
+Ran the force/moment direction test end to end on the bench fixture. All 6
+actuator channels plus both combined cases now match an SDF-derived
+expectation in sign, with lift to 0.1%, roll 0.6%, yaw 0.2%.
+
+**Folded.** → `system.md` Actuators→Gazebo row (Sign convention, was TBD) and
+Milestone 1 checklist (now checked); full comparison table and methodology
+corrections in `.claude/specs/force_moment_test.md`.
+
+**The substantive finding: the rotors produced zero net thrust.**
+`gz-sim-multicopter-motor-model-system` applies thrust along the rotor
+*link's* local Z, not the joint axis. foldrotor3's CAD export is Y-up, so
+`PropNJoint` carried `<xyz>0 1 0</xyz>` and each rotor link's local Z lay
+perpendicular to its own spin axis — the thrust vector rotated with the
+propeller and averaged to nothing (measured net lift 0.03 N against a
+15.26 N airframe weight, with ±10.4 N swinging around the XY plane). Closed-
+loop hover could never have worked, and would have presented as a controller
+bug. This is the failure the verification-before-validation order exists to
+catch.
+
+Fixed by rotating the `PropNJoint` frames −90° about X so local +Z is the
+spin axis, with visual/collision/inertial poses counter-rotated so nothing
+physical moved — a change of frame, not of geometry. Verified: at-rest bench
+reading identical before and after (15.2600 N), and lift went from 0.03 N to
+−10.07 N against a −10.08 N prediction.
+
+**A sign trap worth remembering** (cost me one wrong analysis): thrust does
+*not* depend on `turningDirection`. The plugin's `td * sign(v)` cancels
+because the joint velocity is itself commanded as `td * refRotVel / slowdown`.
+`turningDirection` sets only the drag-torque sign. Reasoning about thrust
+direction from it leads to the wrong fix. Detail in
+`reference/gz-rotor-and-sensor-conventions.md`.
+
+**Two fixture defects found and fixed**, both of which silently corrupted
+results before being caught:
+- `bench_mount_joint`'s parent was `world`. gz-sim's ForceTorque system
+  resolves endpoints with `GetLinkFromScopedName()`, which only matches
+  `Link` entities, so it skipped the sensor and advertised no topic at all.
+  Fixed with a massless `mount_plate` link between two fixed joints.
+- The stand sat at 0.1 m with 30 mm clearance; `-s 1 -v 0.5` drove
+  `Arm1TiltLink` 18 mm through the ground plane, moving ~9.5 N off the mount
+  and producing a plausible but spurious wrench. Raised to 0.5 m, guarded by
+  `foldrotor3_tests/test_bench_clearance.py`.
+
+Also: PX4's `server.config` does not load `gz-sim-forcetorque-system`, so a
+`<sensor>` element alone is inert. Declared at model scope in the bench SDF
+to keep the change out of PX4; this works reliably (apparent flakiness during
+testing traced to stale `gz sim` servers left running between launches, not
+the plugin placement).
+
+**Still open — unexplained residual:** a single motor shows ΔFy ≈ ∓0.5 N
+(~5% of thrust) that the expectation puts at zero. Opposite sign per motor,
+so it cancels in the pair. Suspected tilt-joint deflection under thrust load
+(the fold joints demonstrably sag ~0.03 rad), but **not verified**. Affects
+no sign; recorded, not chased.
+
+---
+
 ## 2026-09-05 — Arm axis convention: realigned to the MATLAB lateral layout
 
 Reported symptom: arm1/arm2 looked like they sat on the wrong sides in

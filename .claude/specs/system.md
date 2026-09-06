@@ -25,7 +25,7 @@ verified against the current codebase.
 | Estimator → Controller | EKF2 state | position, velocity, attitude, angular rate | m, m/s, rad, rad/s (assumed) | position: inertial (confirmed); attitude: Euler (confirmed representation); **velocity: OPEN — see controller.md Open questions** | TBD | pos 50Hz, att 250Hz, vel 50Hz, rate 1000Hz (per Simulink; unconfirmed in PX4 module) | TBD | TBD | interface test |
 | Controller → Allocation | state error | desired wrench: Fx_b,Fy_b,Fz_b,Mx_b,My_b,Mz_b | N, N·m | force components: **body required, currently inertial (confirmed bug — fix specified in controller.md)**; moment components: body (unaffected) | TBD | same as above | unconstrained (allocator saturates downstream) | n/a | comparison vs. Simulink |
 | Allocation → Actuators | desired wrench | F1,F2 (thrust), α1,β1,α2,β2 (tilt) | N; rad | body, per-rotor | TBD | same as above | F: [0,15] N; α,β: [-1.0472, 1.0472] rad | TBD | saturation test |
-| Actuators → Gazebo | motors: `command/motor_speed` (idx 0,1); servos: `/model/foldrotor3_0/servo_0..3` (`SIM_GZ_SV_FUNC1..4`=201-204, confirmed set as of PR #3 — was the Milestone 1 blocker below) | applied force/moment | motors rad/s; servos rad (joint position) | **body FRD (X fwd, Y right, Z down) — note the SDF is authored in gz FLU, which is 180° about X from this. Lateral side-by-side rotor pair: Arm1/Prop1 at +Y (+0.2318/+0.2684 m), Arm2/Prop2 at −Y (−0.2348/−0.2684 m), props mirrored to ±0.26838, both at z=+0.0301. Set by `airframe_link_joint` = +90° roll (CAD Y-up → body up) then −90° yaw (arm heading). Verified 2026-09-05 from SDF+STL geometry, not assumption; guarded by `foldrotor3_tests/test_frame_convention.py`** | TBD | TBD — 200 Hz was assumed; nothing in SDF or gz_bridge confirms it | motors: maxRotVelocity 2054.42 rad/s, `SIM_GZ_EC_MIN/MAX` corrected to 308/2054 (was mismatched 150/1000, fixed PR #3) so 100% throttle actually reaches maxRotVelocity; servo angle ±45.26° (±0.79 rad, matches model.sdf joint limit), `SIM_GZ_SV_MINA/MAXA` set accordingly | TBD | force/moment direction test |
+| Actuators → Gazebo | motors: `command/motor_speed` (idx 0,1); servos: `/model/foldrotor3_0/servo_0..3` (`SIM_GZ_SV_FUNC1..4`=201-204, confirmed set as of PR #3 — was the Milestone 1 blocker below) | applied force/moment | motors rad/s; servos rad (joint position) | **body FRD (X fwd, Y right, Z down) — note the SDF is authored in gz FLU, which is 180° about X from this. Lateral side-by-side rotor pair: Arm1/Prop1 at +Y (+0.2318/+0.2684 m), Arm2/Prop2 at −Y (−0.2348/−0.2684 m), props mirrored to ±0.26838, both at z=+0.0301. Set by `airframe_link_joint` = +90° roll (CAD Y-up → body up) then −90° yaw (arm heading). Verified 2026-09-05 from SDF+STL geometry, not assumption; guarded by `foldrotor3_tests/test_frame_convention.py`** | **Verified 2026-09-06 by force/moment direction test, all 6 channels (force_moment_test.md Results). Motors: a positive `-v` gives lift (−Fz FRD), Motor1 −Mx / +Mz and Motor2 +Mx / −Mz, so the counter-rotating pair cancels roll and yaw to <0.001 N·m while lift sums. Servos: a positive `-v` gives −My on Arm1Tilt and Arm2Tilt, −Mx on Arm1Fold, +Mx on Arm2Fold, each a pure moment with no net force. Combined motor+tilt redistributes thrust per cos/sin of the tilt angle. Signs all match the SDF-derived expectation; lift to 0.1%, roll 0.6%, yaw 0.2%. Required fixing the rotor thrust axis, which was perpendicular to the spin axis — guarded by `test_frame_convention.py`.** | TBD — 200 Hz was assumed; nothing in SDF or gz_bridge confirms it | motors: maxRotVelocity 2054.42 rad/s, `SIM_GZ_EC_MIN/MAX` corrected to 308/2054 (was mismatched 150/1000, fixed PR #3) so 100% throttle actually reaches maxRotVelocity; servo angle ±45.26° (±0.79 rad, matches model.sdf joint limit), `SIM_GZ_SV_MINA/MAXA` set accordingly | TBD | force/moment direction test |
 
 ## Verification philosophy
 Verification (did we build it correctly) precedes validation (does it
@@ -51,8 +51,21 @@ this table before the controller itself is suspected.
       the sign/magnitude is correct; that's the next item.
       `servo_load_test_logs/` bench-fixture data (tilt and fold, p-gain
       10/20 sweeps) is separate and was not used to satisfy this row.
-- [ ] Force/moment direction test: known actuator commands produce
-      force/moment in the expected direction and sign
+- [x] **Force/moment direction test — RUN 2026-09-06, PASSED.** All 6
+      actuator channels plus both combined cases verified against an
+      SDF-derived expectation: every sign correct, lift to 0.1%, roll 0.6%,
+      yaw 0.2%. Counter-rotating pair cancels roll and yaw to <0.001 N·m;
+      arm tilt redirects thrust per cos/sin of the tilt angle.
+      **This test exposed and fixed a flight-model defect**: the rotors
+      produced *zero* net thrust because
+      `gz-sim-multicopter-motor-model-system` applies thrust along the rotor
+      link's local Z, and foldrotor3's Y-up CAD left that axis perpendicular
+      to the spin axis — the force rotated with the propeller and averaged
+      out. Closed-loop hover could never have worked, and would have looked
+      like a controller bug. Fixed in `models/foldrotor3/model.sdf` and the
+      bench copy; guarded by
+      `foldrotor3_tests/test_frame_convention.py`. Full comparison table in
+      `force_moment_test.md` Results.
 - [ ] Only after all of the above: attempt closed-loop Offboard hover
       with EKF2 state feedback
 
