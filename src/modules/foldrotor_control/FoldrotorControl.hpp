@@ -5,20 +5,23 @@
  * allocation stack (mc_pos_control, mc_att_control, mc_rate_control,
  * control_allocator) for this vehicle only; those modules are not modified.
  *
- * STEP 2 (skeleton) of the implementation plan: module lifecycle, driving
- * uORB callback, and read-only subscriptions are wired up. No control law
- * runs yet and nothing is published to the actuators — Run() only proves
- * the module starts, receives data, and stops cleanly. The cascade math
- * (PositionVelocityControl / AttitudeRateControl / FoldrotorAllocation)
- * and the actuator_motors/actuator_servos publications land in later steps
- * per the plan, once the control-law source values (see .claude/specs/
- * controller.md, allocation.md) are available to transcribe.
+ * STEP 3 (params) of the implementation plan (.claude/specs/
+ * controller_params.md): the position/velocity/attitude/rate gains from
+ * controller.md are now declared as params (FR_* prefix) and loaded into
+ * a plain Gains struct by parameters_updated(). The quaternion->Euler
+ * conversion required ahead of the cascade math (controller.md Interface)
+ * is wired into Run() using PX4's own matrix::Eulerf/Quatf. No control
+ * law runs yet and nothing is published to the actuators. The cascade
+ * math (PositionVelocityControl / AttitudeRateControl /
+ * FoldrotorAllocation) and the actuator_motors/actuator_servos
+ * publications land in steps 4-5.
  *
  ****************************************************************************/
 
 #pragma once
 
 #include <lib/perf/perf_counter.h>
+#include <matrix/matrix/math.hpp>
 #include <px4_platform_common/defines.h>
 #include <px4_platform_common/module.h>
 #include <px4_platform_common/module_params.h>
@@ -60,6 +63,38 @@ private:
 
 	void parameters_updated();
 
+	// Plain data holder for the cascade gains, populated by
+	// parameters_updated() from the FR_* params below. One field per
+	// controller_params.md table row. Deliberately not the actual control
+	// objects (PositionVelocityControl / AttitudeRateControl) those gains
+	// will eventually live in — that class design is step 4's concern; this
+	// struct exists so step 3 has a concrete target to load params into and
+	// test, without presuming step 4's shape.
+	struct Gains {
+		float pos_p{0.f};
+
+		float vel_xy_ff{0.f};
+		float vel_xy_i{0.f};
+		float vel_xy_d{0.f};
+
+		float vel_z_ff{0.f};
+		float vel_z_i{0.f};
+		float vel_z_d{0.f};
+		float vel_z_grav_ff{0.f};
+
+		float att_p{0.f};
+
+		float rate_rp_ff{0.f};
+		float rate_rp_i{0.f};
+		float rate_rp_d{0.f};
+
+		float rate_yaw_ff{0.f};
+		float rate_yaw_i{0.f};
+		float rate_yaw_d{0.f};
+	};
+
+	Gains _gains{};
+
 	// Driving callback: registered on the fastest input this module needs
 	// (matches mc_rate_control's pattern — see reference/px4-module-patterns.md
 	// item 2/3). The multi-rate cascade (position/velocity @ 50 Hz, attitude
@@ -78,8 +113,41 @@ private:
 
 	vehicle_control_mode_s _vehicle_control_mode{};
 
+	// Quaternion->Euler conversion required ahead of the phi/theta/psi
+	// cascade math (controller.md Interface): vehicle_attitude.q is
+	// FRD-body->NED, converted here with PX4's own 3-2-1 intrinsic
+	// Tait-Bryan utility (matrix::Eulerf), the same convention already
+	// used for Inertial2Body and already the established way this exact
+	// topic is read (mc_att_control, vtol_att_control, EKF2). No custom
+	// conversion math — this is wiring, not derivation. Step 4 consumes
+	// this; nothing reads it yet.
+	matrix::Eulerf _euler{};
+
 	hrt_abstime _last_run{0};
 	hrt_abstime _last_heartbeat_log{0};
 
 	perf_counter_t _loop_perf;
+
+	DEFINE_PARAMETERS(
+		(ParamFloat<px4::params::FR_POS_P>)         _param_fr_pos_p,
+
+		(ParamFloat<px4::params::FR_VEL_XY_FF>)     _param_fr_vel_xy_ff,
+		(ParamFloat<px4::params::FR_VEL_XY_I>)      _param_fr_vel_xy_i,
+		(ParamFloat<px4::params::FR_VEL_XY_D>)      _param_fr_vel_xy_d,
+
+		(ParamFloat<px4::params::FR_VEL_Z_FF>)      _param_fr_vel_z_ff,
+		(ParamFloat<px4::params::FR_VEL_Z_I>)       _param_fr_vel_z_i,
+		(ParamFloat<px4::params::FR_VEL_Z_D>)       _param_fr_vel_z_d,
+		(ParamFloat<px4::params::FR_VEL_Z_GRAV_FF>) _param_fr_vel_z_grav_ff,
+
+		(ParamFloat<px4::params::FR_ATT_P>)         _param_fr_att_p,
+
+		(ParamFloat<px4::params::FR_RATE_RP_FF>)    _param_fr_rate_rp_ff,
+		(ParamFloat<px4::params::FR_RATE_RP_I>)     _param_fr_rate_rp_i,
+		(ParamFloat<px4::params::FR_RATE_RP_D>)     _param_fr_rate_rp_d,
+
+		(ParamFloat<px4::params::FR_RATE_YAW_FF>)   _param_fr_rate_yaw_ff,
+		(ParamFloat<px4::params::FR_RATE_YAW_I>)    _param_fr_rate_yaw_i,
+		(ParamFloat<px4::params::FR_RATE_YAW_D>)    _param_fr_rate_yaw_d
+	)
 };

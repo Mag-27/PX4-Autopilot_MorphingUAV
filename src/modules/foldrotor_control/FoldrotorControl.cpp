@@ -18,6 +18,7 @@ FoldrotorControl::FoldrotorControl() :
 	WorkItem(MODULE_NAME, px4::wq_configurations::rate_ctrl),
 	_loop_perf(perf_alloc(PC_ELAPSED, MODULE_NAME": cycle"))
 {
+	parameters_updated();
 }
 
 FoldrotorControl::~FoldrotorControl()
@@ -39,8 +40,29 @@ FoldrotorControl::init()
 void
 FoldrotorControl::parameters_updated()
 {
-	// No params yet — step 3 adds the position/velocity/attitude/rate gains
-	// from .claude/specs/controller.md here.
+	// Per reference/px4-module-patterns.md item 4: raw _param_fr_* values
+	// are read only here, never from hot control-law code (which doesn't
+	// exist yet — step 4 will read _gains instead).
+	_gains.pos_p = _param_fr_pos_p.get();
+
+	_gains.vel_xy_ff = _param_fr_vel_xy_ff.get();
+	_gains.vel_xy_i = _param_fr_vel_xy_i.get();
+	_gains.vel_xy_d = _param_fr_vel_xy_d.get();
+
+	_gains.vel_z_ff = _param_fr_vel_z_ff.get();
+	_gains.vel_z_i = _param_fr_vel_z_i.get();
+	_gains.vel_z_d = _param_fr_vel_z_d.get();
+	_gains.vel_z_grav_ff = _param_fr_vel_z_grav_ff.get();
+
+	_gains.att_p = _param_fr_att_p.get();
+
+	_gains.rate_rp_ff = _param_fr_rate_rp_ff.get();
+	_gains.rate_rp_i = _param_fr_rate_rp_i.get();
+	_gains.rate_rp_d = _param_fr_rate_rp_d.get();
+
+	_gains.rate_yaw_ff = _param_fr_rate_yaw_ff.get();
+	_gains.rate_yaw_i = _param_fr_rate_yaw_i.get();
+	_gains.rate_yaw_d = _param_fr_rate_yaw_d.get();
 }
 
 void
@@ -82,6 +104,15 @@ FoldrotorControl::Run()
 
 		vehicle_attitude_s attitude{};
 		_vehicle_attitude_sub.copy(&attitude);
+
+		// vehicle_attitude.q is FRD-body->NED (VehicleAttitude.msg); the
+		// cascade math (controller.md) is written in phi/theta/psi, so
+		// convert here rather than in step 4 -- see controller.md
+		// Interface. No custom conversion math: matrix::Eulerf is PX4's
+		// own 3-2-1 intrinsic Tait-Bryan utility, the same convention
+		// Inertial2Body uses, and already how mc_att_control/
+		// vtol_att_control/EKF2 read this exact topic.
+		_euler = matrix::Eulerf(matrix::Quatf(attitude.q));
 
 		trajectory_setpoint_s trajectory_setpoint{};
 		_trajectory_setpoint_sub.copy(&trajectory_setpoint);
@@ -145,9 +176,10 @@ mc_att_control, mc_rate_control, and control_allocator for this vehicle
 only — those modules are not started for this airframe, and are not
 modified by this module's existence.
 
-Status: skeleton only (step 2 of the implementation plan). Subscribes to
-its required inputs and logs a 1 Hz heartbeat; does not yet compute or
-publish any actuator command.
+Status: step 3 of the implementation plan (params + quaternion->Euler
+conversion, see .claude/specs/controller_params.md). Subscribes to its
+required inputs, loads its FR_* gains, and logs a 1 Hz heartbeat; does
+not yet compute or publish any actuator command.
 
 )DESCR_STR");
 

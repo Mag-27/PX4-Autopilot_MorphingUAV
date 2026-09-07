@@ -33,11 +33,19 @@ topic is a quaternion, the module must convert quaternion → Euler
 internally, **same ZYX (yaw-pitch-roll) convention already used for
 `Inertial2Body`**, before any of that cascade math runs. This conversion
 is a new step not present in the Simulink reference (which was never
-given a quaternion to begin with) and is itself a place bugs can hide:
-it has a singularity at pitch = ±90° (gimbal lock in the standard ZYX
-extraction), so it must be validated as part of step 3's tests, not
-assumed correct because the formula is textbook-standard. See
-`controller_params.md` for how step 3 scopes this.
+given a quaternion to begin with), but it is not new math: use
+`matrix::Eulerf(matrix::Quatf(q))`, PX4's own 3-2-1 intrinsic
+Tait-Bryan utility, already the established way this exact topic is
+read across `mc_att_control`, `vtol_att_control`, and EKF2.
+
+The ZYX extraction has a known singularity at pitch = ±90°, but **no
+module-level test for it is required — decided 2026-09-07.** The
+vehicle cannot fly at ±90° pitch (user-confirmed), and the gimbal-lock
+branch lives inside `matrix::Eulerf` (`Euler.hpp:88-94` special-cases
+the pole, sets phi=0, folds phi+psi into psi — no NaN), which carries
+its own coverage under `src/lib/matrix/test/`. See
+`controller_params.md` for how step 3 scopes this, including why this
+is a discarded requirement rather than a deferred one.
 
 **Out:** desired wrench — force (Fx_b,Fy_b,Fz_b), moment
 (Mx_b,My_b,Mz_b), confirmed **body frame** (explicit `_b` suffix in the

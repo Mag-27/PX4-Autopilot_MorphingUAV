@@ -120,17 +120,31 @@ block full *tuning confidence* and are step-4 concerns.
   with the configured defaults" — a reasonable step-3-only interface
   test (no Gazebo required), consistent with the working-style rule that
   every diff needs a test tied to a spec verification criterion.
-- **Step 3 also needs a quaternion→Euler conversion test.** Per
-  `controller.md`'s Interface section (updated 2026-09-07):
-  `vehicle_attitude` delivers a quaternion, but the gains in this table
-  feed a Euler-angle cascade, so step 3's plumbing must introduce the
-  conversion (ZYX, same convention as `Inertial2Body`) as soon as
-  `vehicle_attitude` is read — not defer it to step 4. This conversion
-  has a known singularity at pitch = ±90°; the test must exercise near
-  that boundary, not just a level-attitude case, since a formula being
-  textbook-standard doesn't make the implementation correct. This is a
-  pure-math/no-Gazebo interface test, same category as the param-loading
-  check above.
+- **Step 3 introduces the quaternion→Euler conversion.** Per
+  `controller.md`'s Interface section: `vehicle_attitude` delivers a
+  quaternion, but the gains in this table feed a Euler-angle cascade, so
+  step 3's plumbing must introduce the conversion (ZYX, same convention
+  as `Inertial2Body`) as soon as `vehicle_attitude` is read — not defer
+  it to step 4. The conversion is `matrix::Eulerf(matrix::Quatf(q))`,
+  PX4's own 3-2-1 intrinsic Tait-Bryan utility, already the established
+  way this exact topic is read across `mc_att_control`,
+  `vtol_att_control`, and EKF2 — not new math written here.
+- **No ±90°-pitch singularity test — decided 2026-09-07, discarded not
+  deferred.** An earlier revision of this spec required one. It is not
+  required, for two reasons: (a) the vehicle cannot fly at ±90° pitch
+  (user-confirmed 2026-09-07), so it guards an unreachable state; and
+  (b) the gimbal-lock branch is inside `matrix::Eulerf`
+  (`Euler.hpp:88-94` special-cases the pole, sets phi=0, folds phi+psi
+  into psi — it does not emit NaN), and that library carries its own
+  coverage under `src/lib/matrix/test/`. This module's code is a single
+  delegating call, so a module-level singularity test would assert on
+  someone else's already-tested branch. Recorded here with the reasoning
+  so this reads as a decision, not an omission.
+- Not to be confused with the above: a **finite/NaN guard on estimator
+  input** is a different check — defensive validation of what arrives,
+  not singularity correctness — and belongs with the Estimator→Controller
+  stale-data behavior that `system.md` still lists as TBD, not with
+  step 3.
 - The real verification criterion these params ultimately serve is
   `controller.md`'s existing one: given identical inputs, the PX4
   module's output must match the Simulink reference output within a

@@ -1,0 +1,89 @@
+module_name: foldrotor_control
+parameters:
+- group: Foldrotor Control
+  definitions:
+    FR_POS_P:
+      description:
+        short: Position P gain
+        long: Position proportional gain, all axes (x,y,z) share this value,
+          per the Simulink reference model.
+      type: float
+      default: 3.0
+    FR_VEL_XY_FF:
+      description:
+        short: Velocity X/Y feedforward gain
+      type: float
+      default: 6.0
+    FR_VEL_XY_I:
+      description:
+        short: Velocity X/Y integral gain
+      type: float
+      default: 1.0
+    FR_VEL_XY_D:
+      description:
+        short: Velocity X/Y derivative gain
+      type: float
+      default: 1.0
+    FR_VEL_Z_FF:
+      description:
+        short: Velocity Z feedforward gain
+      type: float
+      default: 7.0
+    FR_VEL_Z_I:
+      description:
+        short: Velocity Z integral gain
+      type: float
+      default: 7.0
+    FR_VEL_Z_D:
+      description:
+        short: Velocity Z derivative gain
+      type: float
+      default: 0.1
+    FR_VEL_Z_GRAV_FF:
+      description:
+        short: Velocity Z gravity feedforward
+        long: Explicit gravity feedforward on the Z velocity loop, per the
+          Simulink reference model.
+      type: float
+      default: 9.81
+    FR_ATT_P:
+      description:
+        short: Attitude P gain
+        long: Attitude proportional gain, all axes (phi,theta,psi) share this
+          value, per the Simulink reference model.
+      type: float
+      default: 3.0
+    FR_RATE_RP_FF:
+      description:
+        short: Roll/pitch rate feedforward gain
+      type: float
+      default: 3.5
+    FR_RATE_RP_I:
+      description:
+        short: Roll/pitch rate integral gain
+      type: float
+      default: 0.1
+    FR_RATE_RP_D:
+      description:
+        short: Roll/pitch rate derivative gain
+      type: float
+      default: 0.5
+    FR_RATE_YAW_FF:
+      description:
+        short: Yaw rate feedforward gain
+      type: float
+      default: 2.5
+    FR_RATE_YAW_I:
+      description:
+        short: Yaw rate integral gain
+        long: Zero per the Simulink reference model — see controller.md's
+          open question on whether this is deliberate.
+      type: float
+      default: 0.0
+    FR_RATE_YAW_D:
+      description:
+        short: Yaw rate derivative gain
+        long: Zero per the Simulink reference model — see controller.md's
+          open question on whether this is deliberate.
+      type: float
+      default: 0.0
