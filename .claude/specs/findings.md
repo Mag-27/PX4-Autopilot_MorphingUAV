@@ -13,6 +13,160 @@ here — see `reference/`.
 
 ---
 
+## 2026-09-07 — Step 4e part 1 wiring decisions (cascade into Run(), no actuator publish)
+
+**Folded.** → `controller.md` ("Run() wiring (decided 2026-09-07, step
+4e part 1)" under Structure), `AttitudeRateControl.hpp` (interface-split
+doc comment), `FoldrotorControl.hpp/.cpp` (member comments). All six
+were user decisions made while wiring PositionVelocityControl (4a),
+Inertial2Body (4b), and AttitudeRateControl (4c) into `Run()`; none is
+recoverable from controller.md's existing prose.
+
+Worth keeping visible rather than pruning to a bare pointer, because a
+future reader could otherwise assume the cadence number came from the
+Simulink reference:
+
+1. **Multi-rate cascade cadence — 50 Hz position/velocity, 250 Hz
+   attitude, 1000 Hz rate — is NOT in controller.md.** Checked by grep
+   across controller.md, controller_params.md, and
+   reference/px4-module-patterns.md before implementing; nothing there
+   specifies cascade timing, only the stage order. This is a step 4e
+   decision, recorded here and now in controller.md, not a spec
+   transcription.
+2. **`AttitudeRateControl`'s interface was split** into
+   `updateAttitude()` (250 Hz) and `updateRate()` (1000 Hz) because
+   `update()` (step 4c) always recomputes `rate_sp` from the current
+   Euler error in one call — there is no way to run its attitude stage
+   slower than its rate stage without this split. `update()` itself is
+   unchanged in behaviour (calls both back to back), so step 4c's 16
+   hand-computed tests still pass as regression tests of the split.
+3. **`euler_sp`: phi_sp/theta_sp pinned to zero**, psi_sp from
+   `trajectory_setpoint.yaw` (held at current heading if NaN) —
+   consistent with controller.md's own explanation that this vehicle
+   translates by thrust vectoring, not body lean.
+4. **Validity/NaN gating**: full mc_pos_control-style — estimator
+   `_valid` flags plus `PX4_ISFINITE` on the setpoint, holding the
+   previous wrench and resetting the integrator on the invalid->valid
+   transition. Generates one new open item: `PositionVelocityControl`
+   has no independent velocity-setpoint path (it derives `vel_sp` from
+   `pos_sp` only), so a NaN position with a live velocity setpoint can't
+   be honored without extending that class — not done here, since that
+   would be a new decision about 4a's class, not this diff's wiring.
+5. **EKF reset counters (`xy_reset_counter` etc.)**: recorded as an
+   explicit open item, not implemented. Nothing is published to
+   actuators yet, so no reset-driven transient can reach the vehicle
+   from this diff.
+6. **Integrator reset on disarm only.** "Reset on disarm and on mode
+   entry" (the original ask) has no clean "mode entry" equivalent: this
+   module has no PX4 flight-mode concept of its own — it always runs the
+   same cascade regardless of what flight mode is active. Only the
+   disarm edge (`flag_armed` true->false) is implemented; the gap is
+   recorded in controller.md rather than guessed at.
+
+Verified in SITL (2026-09-07, `px4_sitl_foldrotor` board config, SIH
+quadx substrate — the module has no dedicated Gazebo model wired into
+its own airframe file yet, so SIH stands in for "real sensor data
+flowing"): `foldrotor_control start`/`status`/`stop` all work; `status`
+printed a live wrench (`F_b`, `M_b`); `mc_pos_control`/`mc_att_control`/
+`mc_rate_control` booted normally alongside it (rc.mc_defaults, not
+disabled); no ERR lines in the boot log. `F_b`'s Z component started
+near +9.81 N (the literal gravity feedforward) and climbed toward
+~10.9 N over several seconds — exactly the FR_VEL_Z_I=7 integrator
+winding up toward the known ~15.26 N hover weight gap that
+`PositionVelocityControl.hpp`'s OPEN ITEM (a) already predicted, with
+the anti-windup confirmed inert (bounds still +/-infinity) exactly as
+documented. This is the wiring behaving as specified, not a new finding.
+
+---
+
+## 2026-09-07 — Attitude/rate-loop semantics (step 4c)
+
+**Folded.** → `controller.md` (new "Attitude/rate-loop form" subsection
+under Structure; Open questions 1 and 2 and the red-highlighted-ports
+bullet all updated with 4c status) and `controller_params.md`
+(FR_RATE_*_FF documented as the P gain, plus a new recorded gap: no
+`FR_RATE_*_I_LIM` param exists to drive the integrator clamp). Detail in
+git history.
+
+One item is worth keeping visible rather than pruning entirely, because
+it is a decision made *against* the available precedent and a future
+reader will otherwise assume it was made in ignorance of it:
+`FR_RATE_*_FF` is read as the P gain even though PX4's own
+`RateControl::update()` (`rate_control.cpp:78`) has a distinct
+`_gain_ff.emult(rate_sp)` setpoint-feedforward term separate from P. The
+Simulink rate-loop diagram would settle it; until then the FF-as-P
+reading stands, and yaw is consequently a pure proportional law.
+
+---
+
+## 2026-09-07 — Correction: step 4a's anti-windup does NOT match mc_pos_control on X/Y
+
+**Folded.** → `PositionVelocityControl.hpp` (decision 3 comment),
+`controller.md` ("Velocity-loop form", item 3), `controller_params.md`
+(wording). Pruned per the rules below, but the substance is worth one
+extra line because it is a repeat-offender failure mode:
+
+Step 4a's fold-in claimed its conditional-integration anti-windup
+"matches `mc_pos_control` (`PositionControl.cpp:158-160`)". **That is
+true for Z only.** Re-read from the file, not memory:
+- `:158-160` — commented "Integrator anti-windup in vertical direction",
+  gates on `_thr_sp(2)` / `vel_error(2)`. Conditional integration, Z only.
+- `:188-198` — X/Y use **tracking anti-windup** (Rundqwist 1990):
+  `arw_gain = 2/_gain_vel_p(0)`, and `vel_error.xy() -= arw_gain *
+  (acc_sp_xy - acc_sp_xy_produced)`. Feeds achievable-vs-desired
+  acceleration back into the error; not a saturation-direction freeze.
+- `:146` — `mc_pos_control` also hard-clamps its Z integral to ±g, which
+  `PositionVelocityControl` does not.
+
+`foldrotor_control` applying uniform conditional integration to all three
+axes is fine and stays as implemented — **the code is unchanged; only the
+claim was wrong.** Switching X/Y to real tracking ARW would be a design
+decision (it needs an achievable-output estimate the module does not have
+until 4d), and is explicitly NOT being made here.
+
+The 4a D-term citation (`:150`, derivative on measurement, negated) was
+checked at the same time and **is** correct for all three axes; it stands.
+
+**The lesson, since this is the second time:** the 4a work asserted a
+precedent match for one line range while having only verified the
+behaviour of another. Cite a file range only for the axes/cases actually
+read. This is the same discipline the 2026-09-05 entry records for
+geometry claims — see the `feedback_geometry_claims` memory.
+
+---
+
+## 2026-09-07 — Velocity-loop semantics resolved by user decision (step 4a)
+
+**Folded.** → `controller.md` (new "Velocity-loop form" subsection under
+Structure; new Open questions 3–5 for the gravity-feedforward units,
+sign, and the still-unresolved Z summing junction) and
+`controller_params.md` (FR_VEL_*_FF documented as the P gain; open item 1
+extended). Detail in git history.
+
+---
+
+## 2026-09-07 — controller.md's Rt verified against PX4's own DCM convention (step 4b)
+
+**Folded.** → `controller.md` ("Identified issues (confirmed) → 1",
+new Status and convention-confirmation paragraphs).
+
+Checked, rather than assumed, that the `Rt` matrix `controller.md` gives
+for `Inertial2Body` really is the "standard ZYX" inertial→body rotation
+it claims to be: it equals `matrix::Dcmf(euler).transpose()`
+element-for-element, PX4's `Dcm(const Euler&)` being the standard 3-2-1
+intrinsic Tait-Bryan body→inertial DCM (`Dcm.hpp:121-142`). **The spec's
+claim holds — no correction needed.** Recorded because the check is what
+licenses composing this stage directly with step 3's `_euler`, and
+because a silent convention mismatch here would have surfaced only as a
+sign error during yawed translation, which is the hardest class of bug
+to attribute (system.md's whole premise).
+
+Resolves no contract-table row on its own: the Controller→Allocation row
+stays open, since the force components are still inertial at runtime —
+the rotation exists as tested pure math but nothing calls it until 4e.
+
+---
+
 ## 2026-09-07 — foldrotor_control module skeleton audit (build wiring, uORB interfaces, spec drift)
 
 **Folded.** → `controller.md` (Status, Interface — quaternion not Euler,

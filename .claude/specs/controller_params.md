@@ -63,6 +63,36 @@ deliberate replication of the Simulink structure, not an oversight, and
 should not be "fixed" to match PX4 convention without a decision to do
 so.
 
+**What `FR_VEL_*_FF` means — decided 2026-09-07 (step 4a).** The table
+records FF/I/D per velocity loop with no separate P term. That is now
+read as: **FF *is* the P gain, applied to the velocity error**, giving
+`F = FF*e_v + I*integral(e_v) - D*vel_dot`. The competing reading (FF as
+a true feedforward on `v_sp`, plus an unrecorded P) was rejected — it
+requires a P value that appears in no spec. The param names are left
+alone because they are already published and renaming them would churn
+saved airframe configs; only the documented meaning changes. See
+`controller.md`'s "Velocity-loop form" section for the full set of
+decisions this belongs to (derivative-on-measurement, conditional
+integration on all three axes, gravity-feedforward units and sign).
+
+The same reading was extended to the **rate** loop's
+`FR_RATE_RP_FF`/`FR_RATE_YAW_FF` on 2026-09-07 (step 4c) — as a separate
+decision, not an inherited assumption. Worth recording that the rate loop
+had a real precedent pointing the other way: PX4's `RateControl::update()`
+(`src/lib/rate_control/rate_control.cpp:78`) carries a distinct
+`_gain_ff.emult(rate_sp)` term applied to the setpoint, separate from its
+P gain. The FF-as-P reading was chosen anyway, because the alternative
+needs a P value no spec records and would leave yaw (I = D = 0) with no
+error feedback at all.
+
+**Missing param — new gap identified by step 4c.** `AttitudeRateControl`
+implements `mc_rate_control`'s integrator clamp
+(`rate_control.cpp:112-114`), but there is no `FR_RATE_*_I_LIM` row in
+the table below to drive it, so it defaults to ±infinity and is inert.
+PX4 drives its equivalent from params. Adding one is a decision, not a
+transcription — the Simulink model supplies no value — so it is recorded
+here as a gap rather than filled in.
+
 `min`/`max`/`increment`/`decimal` are left **TBD**: `controller.md` gives
 only the Simulink-confirmed default values, no tuning range. Filling
 these in is a step-4/5 concern once the control law exists to tune
@@ -72,18 +102,18 @@ constraint.
 | Param | Loop | Meaning | Default | Notes |
 |---|---|---|---|---|
 | `FR_POS_P` | Position | P gain, all axes (x,y,z) | 3.0 | Shared across axes, per Simulink |
-| `FR_VEL_XY_FF` | Velocity (X/Y) | Feedforward gain | 6.0 | |
+| `FR_VEL_XY_FF` | Velocity (X/Y) | **P gain on the velocity error** (see note) | 6.0 | Name says FF; meaning is P — decided 2026-09-07 |
 | `FR_VEL_XY_I` | Velocity (X/Y) | Integral gain | 1.0 | |
 | `FR_VEL_XY_D` | Velocity (X/Y) | Derivative gain | 1.0 | |
-| `FR_VEL_Z_FF` | Velocity (Z) | Feedforward gain | 7.0 | |
+| `FR_VEL_Z_FF` | Velocity (Z) | **P gain on the velocity error** (see note) | 7.0 | Name says FF; meaning is P — decided 2026-09-07 |
 | `FR_VEL_Z_I` | Velocity (Z) | Integral gain | 7.0 | |
 | `FR_VEL_Z_D` | Velocity (Z) | Derivative gain | 0.1 | |
 | `FR_VEL_Z_GRAV_FF` | Velocity (Z) | Gravity feedforward | 9.81 | See open item below — Z loop also has an extra summing junction not present on X/Y; not represented as a separate param here, since it's a control-law structure question (step 4), not a gain value |
 | `FR_ATT_P` | Attitude | P gain, all axes (phi,theta,psi) | 3.0 | Shared across axes, per Simulink |
-| `FR_RATE_RP_FF` | Rate (roll/pitch, Mx_b/My_b) | Feedforward gain | 3.5 | |
+| `FR_RATE_RP_FF` | Rate (roll/pitch, Mx_b/My_b) | **P gain on the rate error** (see note) | 3.5 | Name says FF; meaning is P — decided 2026-09-07 |
 | `FR_RATE_RP_I` | Rate (roll/pitch) | Integral gain | 0.1 | |
 | `FR_RATE_RP_D` | Rate (roll/pitch) | Derivative gain | 0.5 | |
-| `FR_RATE_YAW_FF` | Rate (yaw, Mz_b) | Feedforward gain | 2.5 | |
+| `FR_RATE_YAW_FF` | Rate (yaw, Mz_b) | **P gain on the rate error** (see note) | 2.5 | Name says FF; meaning is P — decided 2026-09-07 |
 | `FR_RATE_YAW_I` | Rate (yaw) | Integral gain | 0.0 | See open item below — confirm deliberate |
 | `FR_RATE_YAW_D` | Rate (yaw) | Derivative gain | 0.0 | See open item below — confirm deliberate |
 
@@ -104,7 +134,18 @@ These are restated from `controller.md`, not decided here:
    as a param; the *summing junction* is a control-law structure question
    that step 4 must resolve when the math is actually implemented — it
    does not block defining the params in this table.
-2. **Yaw rate loop zero I/D gain.** `controller.md`: "confirm intentional
+   **Step 4a status (2026-09-07): still open, and two further problems
+   with `FR_VEL_Z_GRAV_FF` itself were identified and are also carried
+   rather than resolved** — its *units* (9.81 is an acceleration, but the
+   loop output is a force in N and this airframe is ≈1.556 kg) and its
+   *sign* (+9.81 on the NED Z axis points down, not up). The value is
+   implemented literally as this table records it. See `controller.md`
+   Open questions 3–5; a decision on any of the three changes the Z loop
+   and its tests, not just a tuning number.
+2. **Yaw rate loop zero I/D gain.** Step 4c implemented these as given
+   and invented nothing; combined with the FF-as-P decision, yaw is now
+   a pure proportional law, guarded by a regression test that asserts
+   the yaw integral stays at exactly zero. `controller.md`: "confirm intentional
    (consistent with the small k=0.017 drag-coupling term) vs. unfinished
    tuning." `FR_RATE_YAW_I`/`FR_RATE_YAW_D` are defined at 0.0 either way
    — the param exists and is tunable regardless of which explanation is
@@ -163,4 +204,7 @@ block full *tuning confidence* and are step-4 concerns.
 ## Not specified here
 - Tuning ranges (`min`/`max`/`increment`/`decimal`) — step 4/5.
 - The control law that reads these gains — step 4, `controller.md`.
+  Steps 4a (position/velocity), 4b (inertial→body rotation) and 4c
+  (attitude/rate) now exist as pure math; nothing is wired into `Run()`
+  until 4e.
 - Whether `FR_` is the final prefix — open until confirmed.

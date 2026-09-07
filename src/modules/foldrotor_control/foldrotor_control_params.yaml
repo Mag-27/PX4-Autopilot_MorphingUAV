@@ -11,7 +11,11 @@ parameters:
       default: 3.0
     FR_VEL_XY_FF:
       description:
-        short: Velocity X/Y feedforward gain
+        short: Velocity X/Y proportional gain
+        long: Despite the _FF suffix, this is the P gain applied to the
+          velocity error, not a feedforward on the setpoint — decided
+          2026-09-07, see controller.md "Velocity-loop form". The name is
+          kept because the param is already published.
       type: float
       default: 6.0
     FR_VEL_XY_I:
@@ -26,7 +30,11 @@ parameters:
       default: 1.0
     FR_VEL_Z_FF:
       description:
-        short: Velocity Z feedforward gain
+        short: Velocity Z proportional gain
+        long: Despite the _FF suffix, this is the P gain applied to the
+          velocity error, not a feedforward on the setpoint — decided
+          2026-09-07, see controller.md "Velocity-loop form". The name is
+          kept because the param is already published.
       type: float
       default: 7.0
     FR_VEL_Z_I:
@@ -55,7 +63,13 @@ parameters:
       default: 3.0
     FR_RATE_RP_FF:
       description:
-        short: Roll/pitch rate feedforward gain
+        short: Roll/pitch rate proportional gain
+        long: Despite the _FF suffix, this is the P gain applied to the
+          rate error, not a feedforward on the setpoint — decided
+          2026-09-07, see controller.md "Attitude/rate-loop form". Note
+          this differs from PX4's own rate controller, which has a
+          separate setpoint feedforward term. The name is kept because
+          the param is already published.
       type: float
       default: 3.5
     FR_RATE_RP_I:
@@ -70,7 +84,13 @@ parameters:
       default: 0.5
     FR_RATE_YAW_FF:
       description:
-        short: Yaw rate feedforward gain
+        short: Yaw rate proportional gain
+        long: Despite the _FF suffix, this is the P gain applied to the
+          rate error, not a feedforward on the setpoint — decided
+          2026-09-07, see controller.md "Attitude/rate-loop form". Note
+          this differs from PX4's own rate controller, which has a
+          separate setpoint feedforward term. The name is kept because
+          the param is already published.
       type: float
       default: 2.5
     FR_RATE_YAW_I:
