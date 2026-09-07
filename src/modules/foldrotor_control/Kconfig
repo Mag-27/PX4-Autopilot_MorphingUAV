@@ -1,0 +1,10 @@
+menuconfig MODULES_FOLDROTOR_CONTROL
+	bool "foldrotor_control"
+	default n
+	---help---
+		Enable support for foldrotor_control — the standalone position/
+		velocity/attitude/rate/allocation module for the foldrotor3
+		fully-actuated bi-rotor vehicle. Replaces mc_pos_control,
+		mc_att_control, mc_rate_control, and control_allocator for that
+		vehicle only; does not modify or disable those modules for any
+		other airframe.

@@ -1,10 +1,15 @@
 # Controller Specification
 
 ## Status
-**Not yet implemented in PX4.** As of the 2026-08-27 audit, no
-standalone foldrotor controller module exists in `src/`. This spec is
-the contract to build against, not a description of existing code. The
-reference implementation is the Simulink model.
+**Skeleton only, as of the 2026-09-07 audit.**
+`src/modules/foldrotor_control/` exists (`FoldrotorControl.cpp/.hpp`),
+but it is lifecycle/uORB plumbing only: the module starts, subscribes to
+its required inputs, and logs a heartbeat — it does not yet compute or
+publish any control law. `parameters_updated()` is an empty stub (see
+`controller_params.md`, step 3). No wrench is computed, nothing is
+published to `Control_Alloc`/actuators. This spec remains the contract
+to build the actual control law against, not a description of existing
+behavior. The reference implementation is the Simulink model.
 (`src/modules/mc_raptor` exists in this tree but is an unrelated
 RL-policy flight-mode module — don't mistake it for this target.)
 
@@ -14,10 +19,26 @@ Simulink model is the source of truth for the math. This spec covers the
 PX4 module's I/O contract, not a re-derivation of the control law.
 
 ## Interface
-**In:** state from estimator — position (inertial, confirmed),
-velocity (frame open — see Open questions), attitude (Euler angles
-phi/theta/psi, confirmed representation), angular rate (frame/units:
-see system.md contract table)
+**In:** state from estimator — position (inertial/NED, confirmed),
+velocity (inertial/NED, confirmed — same frame as position, per
+`VehicleLocalPosition.msg`), attitude (**quaternion on the wire**, not
+Euler — `vehicle_attitude` publishes `q[4]`, Hamilton convention, FRD
+body → NED, per `VehicleAttitude.msg`; confirmed 2026-09-07), angular
+rate (FRD body, rad/s, confirmed via `VehicleAngularVelocity.msg`).
+
+The Simulink cascade math (position P → velocity PID → attitude P → rate
+PID) is written in terms of Euler angles phi/theta/psi throughout,
+including the `Inertial2Body` rotation above. Since the actual PX4
+topic is a quaternion, the module must convert quaternion → Euler
+internally, **same ZYX (yaw-pitch-roll) convention already used for
+`Inertial2Body`**, before any of that cascade math runs. This conversion
+is a new step not present in the Simulink reference (which was never
+given a quaternion to begin with) and is itself a place bugs can hide:
+it has a singularity at pitch = ±90° (gimbal lock in the standard ZYX
+extraction), so it must be validated as part of step 3's tests, not
+assumed correct because the formula is textbook-standard. See
+`controller_params.md` for how step 3 scopes this.
+
 **Out:** desired wrench — force (Fx_b,Fy_b,Fz_b), moment
 (Mx_b,My_b,Mz_b), confirmed **body frame** (explicit `_b` suffix in the
 Simulink model). Must match allocation.md's expected input.

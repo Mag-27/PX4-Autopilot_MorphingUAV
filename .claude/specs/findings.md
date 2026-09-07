@@ -13,6 +13,19 @@ here — see `reference/`.
 
 ---
 
+## 2026-09-07 — foldrotor_control module skeleton audit (build wiring, uORB interfaces, spec drift)
+
+**Folded.** → `controller.md` (Status, Interface — quaternion not Euler,
+conversion required), `system.md` (Estimator→Controller Frame cell:
+velocity/rate confirmed, attitude corrected to quaternion; "Module scope
+(decided)": stock stack still auto-started via `rc.mc_apps`, must stop
+before step 5), `controller_params.md` (quaternion→Euler conversion test
+added to step 3 verification). Board-config precedent gap resolved by
+reverting `default.px4board` and adding standalone
+`boards/px4/sitl/foldrotor.px4board`. Detail in git history.
+
+---
+
 ## 2026-09-06 — Tilt/fold actuator limit conflict, and α/β→joint mapping is undocumented
 
 **Folded.** → `allocation.md` ("Actuator naming and tilt-limit
