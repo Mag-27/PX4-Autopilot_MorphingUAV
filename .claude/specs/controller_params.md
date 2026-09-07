@@ -129,17 +129,26 @@ block full *tuning confidence* and are step-4 concerns.
   PX4's own 3-2-1 intrinsic Tait-Bryan utility, already the established
   way this exact topic is read across `mc_att_control`,
   `vtol_att_control`, and EKF2 — not new math written here.
-- **No ±90°-pitch singularity test — decided 2026-09-07, discarded not
-  deferred.** An earlier revision of this spec required one. It is not
-  required, for two reasons: (a) the vehicle cannot fly at ±90° pitch
-  (user-confirmed 2026-09-07), so it guards an unreachable state; and
-  (b) the gimbal-lock branch is inside `matrix::Eulerf`
-  (`Euler.hpp:88-94` special-cases the pole, sets phi=0, folds phi+psi
-  into psi — it does not emit NaN), and that library carries its own
-  coverage under `src/lib/matrix/test/`. This module's code is a single
-  delegating call, so a module-level singularity test would assert on
-  someone else's already-tested branch. Recorded here with the reasoning
-  so this reads as a decision, not an omission.
+- **±90°-pitch singularity test — required, decided 2026-09-07, reversing
+  a same-day decision to discard it.** The vehicle still isn't expected
+  to reach ±90° pitch — that fact hasn't changed — but the test costs
+  nothing (it's a handful of pure-math assertions, no Gazebo, no module
+  instantiation) and is kept as a defensive check on this module's own
+  usage of `matrix::Eulerf`, not a claim that the attitude is reachable.
+  Implemented in `FoldrotorControlTest.cpp`
+  (`FoldrotorControlQuaternionToEulerTest`): it round-trips through the
+  exact wire-format conversion `FoldrotorControl.cpp` uses
+  (`matrix::Quatf` constructed from a raw `float[4]`, matching
+  `vehicle_attitude.q`), at both the special-cased band inside
+  `Euler.hpp:88-94` (±90° − 5e-4 rad) and just outside it (±90° − 1e-2
+  rad, still numerically sensitive since cos(theta) is near zero there).
+  It asserts two things: the recovered phi/theta/psi stay finite, and
+  the recovered triple describes the *same rotation* (DCM comparison,
+  not raw angle equality — phi and psi individually aren't unique at
+  gimbal lock, only their combination is). Verified 2026-09-07: builds
+  and passes (`cmake --build build/px4_sitl_test --target
+  functional-FoldrotorControl`, run directly — 4/4 tests pass, including
+  this one).
 - Not to be confused with the above: a **finite/NaN guard on estimator
   input** is a different check — defensive validation of what arrives,
   not singularity correctness — and belongs with the Estimator→Controller

@@ -38,14 +38,23 @@ given a quaternion to begin with), but it is not new math: use
 Tait-Bryan utility, already the established way this exact topic is
 read across `mc_att_control`, `vtol_att_control`, and EKF2.
 
-The ZYX extraction has a known singularity at pitch = ±90°, but **no
-module-level test for it is required — decided 2026-09-07.** The
-vehicle cannot fly at ±90° pitch (user-confirmed), and the gimbal-lock
-branch lives inside `matrix::Eulerf` (`Euler.hpp:88-94` special-cases
-the pole, sets phi=0, folds phi+psi into psi — no NaN), which carries
-its own coverage under `src/lib/matrix/test/`. See
-`controller_params.md` for how step 3 scopes this, including why this
-is a discarded requirement rather than a deferred one.
+The ZYX extraction has a known singularity at pitch = ±90°. **A
+module-level test for it is required — decided 2026-09-07, reversing
+the same-day decision to discard it.** The vehicle still isn't expected
+to reach ±90° pitch (that hasn't changed), but the test is cheap,
+already written, and passing, so it's kept as a defensive check on this
+module's specific usage rather than relying solely on `matrix::Eulerf`
+(`Euler.hpp:88-94` special-cases the pole, sets phi=0, folds phi+psi
+into psi — no NaN) carrying its own coverage under
+`src/lib/matrix/test/`. The kept test (`FoldrotorControlTest.cpp`,
+`FoldrotorControlQuaternionToEulerTest`) checks rotation-equivalence via
+DCM comparison at the pole, not raw phi/theta/psi equality — phi and
+psi individually aren't unique at gimbal lock, but the recovered triple
+must describe the same rotation, since that's what `Inertial2Body`
+(step 4) will actually apply. It exercises the exact wire-format round
+trip (`matrix::Quatf` from a raw `float[4]`) `FoldrotorControl.cpp`
+uses, not just the library in the abstract. See `controller_params.md`
+for how step 3 scopes this.
 
 **Out:** desired wrench — force (Fx_b,Fy_b,Fz_b), moment
 (Mx_b,My_b,Mz_b), confirmed **body frame** (explicit `_b` suffix in the
