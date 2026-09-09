@@ -65,30 +65,50 @@
  *    not require the achievable-output estimate that tracking ARW needs
  *    — but switching to real tracking anti-windup on X/Y would be a
  *    design decision, and is not one that has been made. See
- *    setOutputLimits() for why any of this is inert until step 4d.
+ *    setOutputLimits() for why the conditional-integration mechanism
+ *    itself is still inert on all three axes until step 4d supplies real
+ *    output bounds. **The separate integrator-clamp mechanism (below) is
+ *    no longer inert on Z**: `FR_VEL_Z_I_LIM = 3.0` N, set 2026-09-09
+ *    (findings.md, same date), bounds the accumulated `_vel_int(2)`
+ *    itself, independent of setOutputLimits()/conditional integration.
+ *    X/Y have no such param yet and stay ±infinity — no decision has
+ *    been made there.
  *
- * 4. The output is a force in newtons (allocation.md's contract) and
- *    FR_VEL_Z_GRAV_FF enters as a literal +9.81 on the NED Z axis,
- *    exactly as controller_params.md records it. See the two OPEN
- *    ITEMS below — neither is silently corrected here.
+ * 4. The output is a force in newtons (allocation.md's contract), and
+ *    FR_VEL_Z_GRAV_FF enters as a literal added directly to the Z axis
+ *    (`force(2) += _grav_ff`, no other scaling or sign step). **Resolved
+ *    2026-09-09** (controller.md Open questions 3/4, findings.md
+ *    2026-09-09 "(4)"/"(5)"): the vehicle's own translational dynamics,
+ *    p_ddot = R_b^i * F_b/m - [0,0,g]^T, requires the force-domain
+ *    feedforward on Fz to equal the vehicle's weight mg for p_ddot = 0 at
+ *    a level hover — not the raw 9.81 m/s^2 acceleration literal that was
+ *    there before. Value is now 15.260017 N, the 2026-09-09 Part D
+ *    bench-measured static weight (a direct measurement, not a computed
+ *    mass estimate). See former OPEN ITEMS (a)/(b) below, now resolved.
  *
  * ---------------------------------------------------------------------
  * OPEN ITEMS — carried, not resolved. Do not "fix" these without a
  * decision; each one changes flight behaviour.
  *
- * (a) Gravity feedforward units. 9.81 is an *acceleration*. This
- *     airframe measures 15.26 N (findings.md, 2026-09-06), i.e.
- *     m ~ 1.556 kg, so a force-domain gravity term would be ~15.26 N.
- *     As written, hover leans on the FR_VEL_Z_I = 7 integrator to make
- *     up the remaining ~5.4 N.
+ * (a) [RESOLVED 2026-09-09] Gravity feedforward units. Was 9.81, an
+ *     *acceleration*, in a force-domain loop. This airframe measures
+ *     15.260017 N (findings.md, Part D bench run), so the feedforward is
+ *     now that measured weight directly. Before this fix, hover leaned on
+ *     the FR_VEL_Z_I = 7 integrator to make up the remaining ~5.4 N —
+ *     confirmed by the 2026-09-09 Part D bench run, where F_b.z climbed
+ *     from the literal 9.81 N to Z-thrust saturation from windup alone.
  *
- * (b) Gravity feedforward sign. controller.md confirms position and
- *     velocity are NED, so gravity is +Z and a hover force must be
- *     *negative* Z. A literal +9.81 on Fz_i therefore points *down*.
- *     This reads like the Simulink model was authored Z-up, but that is
- *     not confirmed, and flipping it on a guess is precisely the class
- *     of silent sign inversion that findings.md's 2026-09-05 and
- *     2026-09-06 entries were both caught by.
+ * (b) [RESOLVED 2026-09-09, empirically] Gravity feedforward sign. The
+ *     literal is added directly and positive, and Part D's bench runs
+ *     (both before and after this fix) show the *integrator* winding up
+ *     in the same direction as the feedforward to reach hover weight, not
+ *     opposing it — the sign was already correct for this module's
+ *     runtime convention. This does not, on its own, resolve whether that
+ *     convention is "really" NED with a Z-up-authored Simulink reference,
+ *     or something else; it only confirms the sign this code needs is the
+ *     one it already had. Do not read this as license to guess signs
+ *     elsewhere — it stands on the Part D measurement, not on reasoning
+ *     about the model's authored frame.
  *
  * (c) The Z loop's "extra summing junction not present on X/Y"
  *     (controller.md, "Structure (confirmed from Simulink)") is
@@ -98,12 +118,27 @@
  *     neither implemented nor invented. If it turns out to carry logic,
  *     this class is wrong on Z and the fix belongs here.
  *
+ * (d) [RESOLVED 2026-09-09, Z only] Integrator windup bound. Until now
+ *     the anti-windup mechanism (decision 3) was inert on every axis
+ *     because setOutputLimits() defaulted to +/-infinity, and there was
+ *     no separate clamp on the accumulated integral at all (unlike
+ *     AttitudeRateControl's setIntegratorLimit()). This class now has the
+ *     same setIntegratorLimit() mechanism, and FR_VEL_Z_I_LIM = 3.0 N
+ *     bounds `_vel_int(2)` directly. This is a decision about how much
+ *     the integrator alone may contribute to Fz, deliberately smaller
+ *     than the ~15.26 N hover weight now supplied entirely by
+ *     FR_VEL_Z_GRAV_FF (OPEN ITEM (a)) — the integrator only needs to
+ *     cover real trim/disturbance now, not a structural feedforward gap.
+ *     X and Y have no such param and remain unbounded; that is an
+ *     unmade decision, not an oversight.
+ *
  ****************************************************************************/
 
 #pragma once
 
 #include <matrix/matrix/math.hpp>
 
+#include <cmath>
 #include <float.h>
 
 namespace foldrotor
@@ -133,7 +168,7 @@ public:
 		_vel_d = matrix::Vector3f(xy_d, xy_d, z_d);
 	}
 
-	/** FR_VEL_Z_GRAV_FF, added to the Z axis. See OPEN ITEMS (a) and (b). */
+	/** FR_VEL_Z_GRAV_FF, added to the Z axis. See OPEN ITEMS (a)/(b), resolved 2026-09-09. */
 	void setGravityFeedforward(float grav_ff) { _grav_ff = grav_ff; }
 
 	/**
@@ -158,6 +193,19 @@ public:
 		_lim_lower = lower;
 		_lim_upper = upper;
 	}
+
+	/**
+	 * Symmetric bound on the accumulated integral itself, mirroring
+	 * AttitudeRateControl::setIntegratorLimit() (mc_rate_control's
+	 * _lim_int pattern) — a separate mechanism from setOutputLimits()/the
+	 * conditional-integration anti-windup above. Defaults to
+	 * +/-infinity, i.e. a no-op, on all three axes.
+	 *
+	 * FR_VEL_Z_I_LIM = 3.0 N (2026-09-09, findings.md) is now pushed into
+	 * this on Z only, resolving OPEN ITEM (d) below on that axis. X/Y
+	 * have no corresponding param and stay unbounded.
+	 */
+	void setIntegratorLimit(const matrix::Vector3f &lim) { _lim_int = lim; }
 
 	/** Zero the velocity integrator. 4e calls this on disarm / mode entry. */
 	void resetIntegral() { _vel_int.setZero(); }
@@ -196,7 +244,8 @@ public:
 		// state carried between calls.
 		matrix::Vector3f force = vel_error.emult(_vel_p) + _vel_int - vel_dot.emult(_vel_d);
 
-		// Gravity feedforward, Z only, literal value. OPEN ITEMS (a), (b).
+		// Gravity feedforward, Z only, literal value = measured weight in
+		// newtons (mg), not a raw g literal. OPEN ITEMS (a), (b), resolved 2026-09-09.
 		force(2) += _grav_ff;
 
 		matrix::Vector3f force_limited;
@@ -217,7 +266,16 @@ public:
 			}
 		}
 
-		_vel_int += vel_error.emult(_vel_i) * dt;
+		matrix::Vector3f vel_int = _vel_int + vel_error.emult(_vel_i) * dt;
+
+		for (int i = 0; i < 3; i++) {
+			// Integrator clamp (OPEN ITEM (d)), mirroring
+			// AttitudeRateControl::updateIntegral()'s finiteness guard:
+			// don't propagate a non-finite accumulation.
+			if (std::isfinite(vel_int(i))) {
+				_vel_int(i) = math_constrain(vel_int(i), -_lim_int(i), _lim_int(i));
+			}
+		}
 
 		return force_limited;
 	}
@@ -238,6 +296,7 @@ private:
 
 	matrix::Vector3f _lim_lower{-INFINITY, -INFINITY, -INFINITY};
 	matrix::Vector3f _lim_upper{INFINITY, INFINITY, INFINITY};
+	matrix::Vector3f _lim_int{INFINITY, INFINITY, INFINITY};
 
 	matrix::Vector3f _vel_int;
 };
