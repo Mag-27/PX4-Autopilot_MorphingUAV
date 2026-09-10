@@ -6,20 +6,39 @@
  * control_allocator) for this vehicle only; those modules are not modified.
  *
  * STEP 4e part 1 (.claude/specs/controller.md, controller_params.md):
- * the multi-rate cascade is now wired into Run() — PositionVelocityControl
+ * the multi-rate cascade is wired into Run() — PositionVelocityControl
  * (4a) at 50 Hz, AttitudeRateControl's attitude stage (4c) at 250 Hz and
  * its rate stage every cycle (1000 Hz, this Run()'s native rate),
  * Inertial2Body (4b) rotating the force output between them. The full
  * wrench (_F_b, _M_b) is computed every cycle and held for inspection —
- * getForceBody()/getMomentBody() and the heartbeat log — but is
- * PUBLISHED NOWHERE. No actuator_motors/actuator_servos wiring exists;
- * that, the allocator (4d), and the airframe/rc.txt change that would
- * stop the stock mc_* stack starting are all separate, later diffs. This
- * module is provably inert at the actuator boundary today.
+ * getForceBody()/getMomentBody() and the heartbeat log.
  *
- * Allocation (FoldrotorAllocation, 4d) does not exist yet; _F_b/_M_b are
- * the body-frame wrench allocation.md's Interface expects as input, not
- * an actuator command.
+ * STEP 4e part 2 (.claude/specs/allocation.md): FoldrotorAllocation (4d)
+ * turns that wrench into per-rotor thrust/tilt commands and this module
+ * now publishes actuator_motors/actuator_servos every cycle, gated on
+ * vehicle_control_mode.flag_armed (NaN, per each message's own "NaN
+ * maps to disarmed" contract, when not armed). Publishing is
+ * unconditional, and this module is the sole publisher of these topics
+ * for this airframe: 4026_gz_foldrotor3 no longer sets VEHICLE_TYPE mc,
+ * so the stock control_allocator is not started for this vehicle (plan
+ * open item O-4, resolved -- see print_status()). Fold (alpha) is pinned
+ * to 0 in FoldrotorAllocation -- this module has no lateral
+ * thrust-vectoring authority yet, see FoldrotorAllocation.hpp OPEN ITEM
+ * (a). The newtons->normalized motor conversion inverts model.sdf's
+ * rotor curve using SIM_GZ_EC_MIN1/MAX1, read via param_find/param_get
+ * so the airframe file stays the single source of truth -- see
+ * parameters_updated() and OPEN ITEM O-5 below.
+ *
+ * RESOLVED (2026-09-08) — the wrench sign/frame convention. Confirmed
+ * root cause: Control_Alloc.m (allocation.md's math, matching the
+ * source thesis derivation) was written in body FLU (Z-up);
+ * _F_b/_M_b out of this module's cascade are PX4 body FRD (Z-down), per
+ * controller.md. FLU<->FRD is a 180 deg rotation about body X: X
+ * unchanged, Y and Z negate. Run() applies frdToAllocatorFlu() to both
+ * _F_b and _M_b immediately before calling _allocation.allocate() --
+ * the allocator class itself is untouched and still expects its native
+ * (FLU) convention. See FoldrotorAllocation.hpp OPEN ITEM (c) and
+ * allocation.md for the full argument and record.
  *
  ****************************************************************************/
 
@@ -27,6 +46,7 @@
 
 #include "AttitudeRateControl.hpp"
 #include "CascadeRateGate.hpp"
+#include "FoldrotorAllocation.hpp"
 #include "Inertial2Body.hpp"
 #include "PositionVelocityControl.hpp"
 
@@ -37,9 +57,12 @@
 #include <px4_platform_common/module_params.h>
 #include <px4_platform_common/posix.h>
 #include <px4_platform_common/px4_work_queue/WorkItem.hpp>
+#include <uORB/Publication.hpp>
 #include <uORB/Subscription.hpp>
 #include <uORB/SubscriptionCallback.hpp>
 #include <uORB/SubscriptionInterval.hpp>
+#include <uORB/topics/actuator_motors.h>
+#include <uORB/topics/actuator_servos.h>
 #include <uORB/topics/parameter_update.h>
 #include <uORB/topics/trajectory_setpoint.h>
 #include <uORB/topics/vehicle_angular_velocity.h>
@@ -76,6 +99,33 @@ public:
 	const matrix::Vector3f &getForceBody() const { return _F_b; }
 	const matrix::Vector3f &getMomentBody() const { return _M_b; }
 
+	// Actuator-mapping free functions used by Run() (step 4e part 2).
+	// Public static, not a new helper file (see class comment): this is
+	// what lets FoldrotorControlTest.cpp exercise the mapping without a
+	// work queue, per the step 4e allocation plan's Part C mapping tests.
+
+	/** Newtons -> normalized [0,1] motor command; see FoldrotorControl.cpp for the derivation. */
+	static float thrustToNormalizedMotor(float thrust_n, float ec_min, float ec_max);
+
+	/** beta (tilt, rad) -> normalized [-1,1] servo command; linear, exact, no fudge factor. */
+	static float tiltToNormalizedServo(float beta_rad);
+
+	/** alpha (fold, rad) -> normalized [-1,1] servo command; direct mapping (bench-verified 2026-09-10, see allocation.md). */
+	static float foldToNormalizedServo(float alpha_rad);
+
+	/**
+	 * PX4 body FRD -> Control_Alloc's body FLU, applied to a force or
+	 * moment vector alike (allocation.md open item (c), resolved
+	 * 2026-09-08). FLU<->FRD is a 180 deg rotation about body X: X is
+	 * unchanged, Y and Z both negate. Same coefficients as
+	 * foldrotor3_tests/test_frame_convention.py's FLU_TO_FRD
+	 * (`np.diag([1.0, -1.0, -1.0])`) -- that file is this transform's
+	 * source of truth; this is a transcription, not an independent
+	 * derivation, and the rotation is its own inverse (180 deg) so the
+	 * same function converts either direction.
+	 */
+	static matrix::Vector3f frdToAllocatorFlu(const matrix::Vector3f &v_frd);
+
 private:
 	void Run() override;
 
@@ -98,6 +148,7 @@ private:
 		float vel_z_i{0.f};
 		float vel_z_d{0.f};
 		float vel_z_grav_ff{0.f};
+		float vel_z_i_lim{0.f};
 
 		float att_p{0.f};
 
@@ -131,9 +182,32 @@ private:
 
 	// The computed wrench, held between the position/velocity and
 	// attitude stages' slower cycles. Body/FRD, allocation.md's Interface
-	// input. Published nowhere — see class comment.
+	// input -- see class comment's OPEN ITEM on the sign/frame
+	// convention this is hand off to _allocation as-is.
 	matrix::Vector3f _F_b{};
 	matrix::Vector3f _M_b{};
+
+	// Allocation (4d): stateless pure math, no setters -- see
+	// FoldrotorAllocation.hpp. Minv is derived from M0 at construction.
+	foldrotor::FoldrotorAllocation _allocation;
+
+	// Held between cycles purely for print_status()/the heartbeat log;
+	// not fed back into anything.
+	foldrotor::FoldrotorAllocation::Output _alloc_out{};
+
+	uORB::Publication<actuator_motors_s> _actuator_motors_pub{ORB_ID(actuator_motors)};
+	uORB::Publication<actuator_servos_s> _actuator_servos_pub{ORB_ID(actuator_servos)};
+
+	// Newtons -> normalized motor command (open item O-5, see class
+	// comment): inverts model.sdf's F = motorConstant * omega^2 curve,
+	// then interpolates omega onto SIM_GZ_EC_MIN1/MAX1 -- NOT hardcoded
+	// 308/2054, read from the params so the airframe file stays the
+	// single source of truth. motorConstant/maxRotVelocity themselves
+	// ARE from model.sdf (Tools/simulation/gz/models/foldrotor3/
+	// model.sdf:557-559) and are not exposed as PX4 params, so those two
+	// stay literal.
+	float _sim_gz_ec_min1{308.f};
+	float _sim_gz_ec_max1{2054.f};
 
 	// Reset-on-recovery for the position/velocity integrator: true only
 	// while vehicle_local_position's validity flags and
@@ -196,6 +270,7 @@ private:
 		(ParamFloat<px4::params::FR_VEL_Z_I>)       _param_fr_vel_z_i,
 		(ParamFloat<px4::params::FR_VEL_Z_D>)       _param_fr_vel_z_d,
 		(ParamFloat<px4::params::FR_VEL_Z_GRAV_FF>) _param_fr_vel_z_grav_ff,
+		(ParamFloat<px4::params::FR_VEL_Z_I_LIM>)   _param_fr_vel_z_i_lim,
 
 		(ParamFloat<px4::params::FR_ATT_P>)         _param_fr_att_p,
 

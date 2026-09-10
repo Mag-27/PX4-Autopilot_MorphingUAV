@@ -30,6 +30,8 @@ def main():
     parser.add_argument("--connect", default="udpin:0.0.0.0:14550")
     parser.add_argument("--altitude", type=float, default=2.0,
                          help="hold altitude in meters (positive = up; sent as negative NED z)")
+    parser.add_argument("--x", type=float, default=0.0, help="local NED x setpoint, meters")
+    parser.add_argument("--y", type=float, default=0.0, help="local NED y setpoint, meters")
     parser.add_argument("--hold-seconds", type=float, default=60.0)
     parser.add_argument("--log", default=None, help="optional path to write CSV log of local position/attitude")
     args = parser.parse_args()
@@ -48,7 +50,7 @@ def main():
     print("streaming setpoint for 2s before mode switch...")
     t0 = time.time()
     while time.time() - t0 < 2.0:
-        send_sp(master, z=z_sp)
+        send_sp(master, x=args.x, y=args.y, z=z_sp)
         time.sleep(0.05)
 
     print("requesting OFFBOARD mode...")
@@ -71,7 +73,7 @@ def main():
     last_local_pos = None
     last_attitude = None
     while time.time() - t_start < args.hold_seconds:
-        send_sp(master, z=z_sp)
+        send_sp(master, x=args.x, y=args.y, z=z_sp)
         msg = master.recv_match(type=['ATTITUDE', 'LOCAL_POSITION_NED'], blocking=False)
         if msg is not None:
             if msg.get_type() == 'LOCAL_POSITION_NED':

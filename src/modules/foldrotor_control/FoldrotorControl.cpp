@@ -11,7 +11,79 @@
 
 using namespace time_literals;
 
+namespace
+{
+// model.sdf's rotor model (Tools/simulation/gz/models/foldrotor3/
+// model.sdf:557-559): F = motorConstant * omega^2. Not a PX4 param --
+// literal, matching allocation.md's step-4e plan.
+constexpr float kMotorConstant = 5.4844e-06f;
+} // namespace
+
 ModuleBase::Descriptor FoldrotorControl::desc{task_spawn, custom_command, print_usage};
+
+// Actuator-mapping functions used by Run() (step 4e part 2). Public
+// static class methods, not a new helper file (see class comment): this
+// is what lets FoldrotorControlTest.cpp exercise the mapping directly,
+// without a work queue -- the step 4e allocation plan's "one structural
+// concession" for the mapping tests.
+
+float
+FoldrotorControl::thrustToNormalizedMotor(float thrust_n, float ec_min, float ec_max)
+{
+	// Newtons -> normalized [0,1] motor command, open item O-5 (see
+	// class comment). Inverts the SDF rotor curve to get the commanded
+	// angular rate, then interpolates that rate onto [ec_min, ec_max] --
+	// the same range SIM_GZ_EC_MIN1/MAX1 drive Gazebo's rotor plugin
+	// with. NOT [-1,1]: the exact [-1,1]-vs-[0,1] semantics of
+	// actuator_motors.control on this path were traced and NOT fully
+	// pinned down this session -- this is the bench test's job to
+	// confirm empirically before any free flight.
+	const float thrust_clamped = math::constrain(thrust_n, 0.f, foldrotor::FoldrotorAllocation::kMaxThrust);
+	const float omega = sqrtf(thrust_clamped / kMotorConstant);
+	const float normalized = (omega - ec_min) / (ec_max - ec_min);
+	return math::constrain(normalized, 0.f, 1.f);
+}
+
+float
+FoldrotorControl::tiltToNormalizedServo(float beta_rad)
+{
+	// beta (tilt, rad) -> normalized [-1,1] servo command. Linear and
+	// exact: SIM_GZ_SV_MINA/MAXA = +-45.26 deg = +-0.79 rad =
+	// FoldrotorAllocation::kMaxTilt, and MixingOutput::
+	// output_limit_calc_single (src/lib/mixer_module/mixer_module.cpp:565)
+	// interpolates [-1,1] onto [min,max] -- so beta/kMaxTilt is correct
+	// with no fudge factor. Clamped defensively regardless.
+	return math::constrain(beta_rad / foldrotor::FoldrotorAllocation::kMaxTilt, -1.f, 1.f);
+}
+
+float
+FoldrotorControl::foldToNormalizedServo(float alpha_rad)
+{
+	// fold (alpha, rad) -> normalized [-1,1] servo command, direct
+	// (no negation). Bench-measured 2026-09-10 (force/torque sensor,
+	// both arms, motor + own fold servo): a positive ArmNFoldJoint
+	// angle produces NEGATIVE Y thrust for both Arm1 and Arm2 -- the
+	// opposite of the "SDF geometry, verified 2026-09-06" claim that
+	// used to justify negating here. Since Control_Alloc's own
+	// convention is also +alpha -> -Ty, the mapping is direct: no sign
+	// flip needed. See allocation.md's alpha sign-mapping section for
+	// the measurement data.
+	return math::constrain(alpha_rad / foldrotor::FoldrotorAllocation::kMaxTilt, -1.f, 1.f);
+}
+
+matrix::Vector3f
+FoldrotorControl::frdToAllocatorFlu(const matrix::Vector3f &v_frd)
+{
+	// allocation.md OPEN ITEM (c), resolved 2026-09-08: PX4 body FRD ->
+	// Control_Alloc's body FLU. 180 deg rotation about body X -- X
+	// unchanged, Y and Z negate. Coefficients transcribed from
+	// foldrotor3_tests/test_frame_convention.py's FLU_TO_FRD
+	// (`np.diag([1.0, -1.0, -1.0])`), the project's single source of
+	// truth for this transform -- not an independent derivation. The
+	// rotation is its own inverse (180 deg), so the same expression
+	// converts either direction.
+	return matrix::Vector3f(v_frd(0), -v_frd(1), -v_frd(2));
+}
 
 FoldrotorControl::FoldrotorControl() :
 	ModuleParams(nullptr),
@@ -53,6 +125,7 @@ FoldrotorControl::parameters_updated()
 	_gains.vel_z_i = _param_fr_vel_z_i.get();
 	_gains.vel_z_d = _param_fr_vel_z_d.get();
 	_gains.vel_z_grav_ff = _param_fr_vel_z_grav_ff.get();
+	_gains.vel_z_i_lim = _param_fr_vel_z_i_lim.get();
 
 	_gains.att_p = _param_fr_att_p.get();
 
@@ -64,19 +137,45 @@ FoldrotorControl::parameters_updated()
 	_gains.rate_yaw_i = _param_fr_rate_yaw_i.get();
 	_gains.rate_yaw_d = _param_fr_rate_yaw_d.get();
 
-	// Push into the cascade objects. Output/integrator limits are left at
-	// their +/-infinity defaults -- controller.md and controller_params.md
-	// are both explicit that inventing bounds records an assumption as a
+	// Push into the cascade objects. Output limits are left at their
+	// +/-infinity defaults -- controller.md and controller_params.md are
+	// both explicit that inventing bounds records an assumption as a
 	// constraint; the real values come from the allocator (4d), not from
-	// here.
+	// here. The *integrator* clamp is a separate mechanism: FR_VEL_Z_I_LIM
+	// = 3.0 N (2026-09-09, findings.md) bounds the Z integral's own
+	// contribution directly, independent of the (still-inert)
+	// conditional-integration anti-windup above. X/Y have no such param
+	// and stay +/-infinity -- no decision has been made there.
 	_pos_vel_control.setPositionGain(_gains.pos_p);
 	_pos_vel_control.setVelocityGains(_gains.vel_xy_ff, _gains.vel_xy_i, _gains.vel_xy_d,
 					  _gains.vel_z_ff, _gains.vel_z_i, _gains.vel_z_d);
 	_pos_vel_control.setGravityFeedforward(_gains.vel_z_grav_ff);
+	_pos_vel_control.setIntegratorLimit(matrix::Vector3f(INFINITY, INFINITY, _gains.vel_z_i_lim));
 
 	_att_rate_control.setAttitudeGain(_gains.att_p);
 	_att_rate_control.setRateGains(_gains.rate_rp_ff, _gains.rate_rp_i, _gains.rate_rp_d,
 				       _gains.rate_yaw_ff, _gains.rate_yaw_i, _gains.rate_yaw_d);
+
+	// SIM_GZ_EC_MIN1/MAX1 -- NOT hardcoded 308/2054 (open item O-5, see
+	// class comment): read here so the airframe file
+	// (4026_gz_foldrotor3) stays the single source of truth for the
+	// motor rate range. param_find() rather than a DEFINE_PARAMETERS
+	// entry because these are SIM_GZ_* params owned by the simulator
+	// bridge module, not this module's own FR_* namespace.
+	param_t ec_min1_handle = param_find("SIM_GZ_EC_MIN1");
+	param_t ec_max1_handle = param_find("SIM_GZ_EC_MAX1");
+
+	if (ec_min1_handle != PARAM_INVALID) {
+		int32_t ec_min1{};
+		param_get(ec_min1_handle, &ec_min1);
+		_sim_gz_ec_min1 = (float)ec_min1;
+	}
+
+	if (ec_max1_handle != PARAM_INVALID) {
+		int32_t ec_max1{};
+		param_get(ec_max1_handle, &ec_max1);
+		_sim_gz_ec_max1 = (float)ec_max1;
+	}
 }
 
 void
@@ -144,6 +243,24 @@ FoldrotorControl::Run()
 		// the disarm edge; see the member comment on _armed_prev for why
 		// "mode entry" has no equivalent here.
 		if (_armed_prev && !_vehicle_control_mode.flag_armed) {
+			_pos_vel_control.resetIntegral();
+			_att_rate_control.resetIntegral();
+		}
+
+		// Arm-triggered integrator reset (2026-09-09, symmetric fix to the
+		// disarm-edge reset above). The wrench (_F_b/_M_b, including
+		// FR_VEL_Z_I's integrator) is computed every cycle regardless of
+		// arm state -- while disarmed, that integral has no physical
+		// feedback to correct it against, so it silently winds toward
+		// whatever the stale/pre-arm position error demands (now capped
+		// at FR_VEL_Z_I_LIM = 3.0 N as of 2026-09-09, but still nonzero
+		// and still stale). Without this reset, the moment real thrust
+		// engages on arm it inherits that accumulated bias directly,
+		// which is what produced the arm-time thrust-ceiling spike and
+		// attitude failsafe recorded in findings.md's 2026-09-09 (2)
+		// entry -- confirmed to be that cause, not the trajectory_setpoint
+		// gap fixed alongside it.
+		if (!_armed_prev && _vehicle_control_mode.flag_armed) {
 			_pos_vel_control.resetIntegral();
 			_att_rate_control.resetIntegral();
 		}
@@ -221,19 +338,92 @@ FoldrotorControl::Run()
 		const matrix::Vector3f rate_dot(angular_velocity.xyz_derivative);
 		_M_b = _att_rate_control.updateRate(rate, rate_dot, dt, landed);
 
-		// _F_b / _M_b now hold the full computed wrench. PUBLISHED
-		// NOWHERE -- see class comment. Anti-windup/integrator-limit
-		// bounds are still +/-infinity (inert) until 4d.
+		// --- Allocation (4d) + actuator publish (4e part 2), every
+		// cycle at the rate loop's 1000 Hz. FoldrotorAllocation is
+		// stateless and cheap (one 6x6 multiply plus two atan2 calls),
+		// so it needs no gate of its own -- matches how the rate stage
+		// is already treated. Output-limit bounds (and the
+		// conditional-integration anti-windup they drive) are still
+		// +/-infinity (inert) -- choosing real bounds is a control
+		// decision not made in this diff (see the plan's open items).
+		// FR_VEL_Z_I's own integrator clamp is a separate mechanism and
+		// IS bounded now (FR_VEL_Z_I_LIM = 3.0 N, 2026-09-09); see
+		// PositionVelocityControl.hpp OPEN ITEM (d).
+		//
+		// _F_b/_M_b are PX4 body FRD; FoldrotorAllocation's math
+		// (allocation.md's Control_Alloc, class comment RESOLVED note)
+		// is body FLU -- convert both immediately before allocate(),
+		// per-cycle, so _F_b/_M_b themselves stay in their native FRD
+		// frame for the heartbeat log / print_status() / getForceBody()
+		// / getMomentBody() above.
+		const matrix::Vector3f F_alloc = frdToAllocatorFlu(_F_b);
+		const matrix::Vector3f M_alloc = frdToAllocatorFlu(_M_b);
+		_alloc_out = _allocation.allocate(F_alloc, M_alloc);
+
+		actuator_motors_s actuator_motors{};
+		actuator_servos_s actuator_servos{};
+
+		actuator_motors.timestamp_sample = now;
+		actuator_servos.timestamp_sample = now;
+
+		for (int i = 0; i < actuator_motors_s::NUM_CONTROLS; i++) {
+			actuator_motors.control[i] = NAN;
+		}
+
+		for (int i = 0; i < actuator_servos_s::NUM_CONTROLS; i++) {
+			actuator_servos.control[i] = NAN;
+		}
+
+		// Arm/mode gate -- reuse _vehicle_control_mode.flag_armed,
+		// already read above for the disarm-edge integrator reset, no
+		// new subscription. Not armed: leave every channel at NaN, per
+		// ActuatorMotors.msg / ActuatorServos.msg's own contract ("NaN
+		// maps to disarmed") -- NOT zero, which on actuator_motors is a
+		// live commanded value output_limit_calc_single maps into the
+		// ESC range, not "off".
+		if (_vehicle_control_mode.flag_armed) {
+			// Channel mapping, 4026_gz_foldrotor3 + force_moment_bench_commands.md:
+			//   motors.control[0] = Motor1 (101, Prop1Joint, +Y) <- F1
+			//   motors.control[1] = Motor2 (102, Prop2Joint, -Y) <- F2
+			//   servos.control[0] = Servo1 (201, Arm1FoldJoint)  <- alpha1
+			//   servos.control[1] = Servo2 (202, Arm1TiltJoint)  <- beta1
+			//   servos.control[2] = Servo3 (203, Arm2FoldJoint)  <- alpha2
+			//   servos.control[3] = Servo4 (204, Arm2TiltJoint)  <- beta2
+			actuator_motors.control[0] = thrustToNormalizedMotor(_alloc_out.F1, _sim_gz_ec_min1, _sim_gz_ec_max1);
+			actuator_motors.control[1] = thrustToNormalizedMotor(_alloc_out.F2, _sim_gz_ec_min1, _sim_gz_ec_max1);
+
+			actuator_servos.control[0] = foldToNormalizedServo(_alloc_out.alpha1);
+			actuator_servos.control[1] = tiltToNormalizedServo(_alloc_out.beta1);
+			actuator_servos.control[2] = foldToNormalizedServo(_alloc_out.alpha2);
+			actuator_servos.control[3] = tiltToNormalizedServo(_alloc_out.beta2);
+		}
+
+		actuator_motors.timestamp = hrt_absolute_time();
+		actuator_servos.timestamp = hrt_absolute_time();
+
+		// Publish unconditionally (step 4e plan decision 1). This module
+		// is the sole publisher of these topics for this airframe: the
+		// stock control_allocator is no longer started for
+		// 4026_gz_foldrotor3 (plan open item O-4, resolved by the
+		// airframe no longer setting VEHICLE_TYPE mc) -- see
+		// print_status().
+		_actuator_motors_pub.publish(actuator_motors);
+		_actuator_servos_pub.publish(actuator_servos);
 
 		if (now - _last_heartbeat_log > 1_s) {
 			_last_heartbeat_log = now;
 			PX4_INFO("foldrotor_control alive — armed=%d offboard=%d position_ctrl=%d "
-				 "F_b=[%.2f %.2f %.2f]N M_b=[%.3f %.3f %.3f]Nm (NOT PUBLISHED)",
+				 "F_b=[%.2f %.2f %.2f]N M_b=[%.3f %.3f %.3f]Nm "
+				 "F1=%.2f F2=%.2f a1=%.3f a2=%.3f b1=%.3f b2=%.3f sat=%d",
 				 _vehicle_control_mode.flag_armed,
 				 _vehicle_control_mode.flag_control_offboard_enabled,
 				 _vehicle_control_mode.flag_control_position_enabled,
 				 (double)_F_b(0), (double)_F_b(1), (double)_F_b(2),
-				 (double)_M_b(0), (double)_M_b(1), (double)_M_b(2));
+				 (double)_M_b(0), (double)_M_b(1), (double)_M_b(2),
+				 (double)_alloc_out.F1, (double)_alloc_out.F2,
+				 (double)_alloc_out.alpha1, (double)_alloc_out.alpha2,
+				 (double)_alloc_out.beta1, (double)_alloc_out.beta2,
+				 _alloc_out.saturated);
 		}
 	}
 
@@ -242,13 +432,27 @@ FoldrotorControl::Run()
 
 int FoldrotorControl::print_status()
 {
-	PX4_INFO("status: step 4e part 1 -- cascade wired, wrench computed, PUBLISHES NOTHING to actuators");
+	PX4_INFO("status: step 4e part 2 -- cascade + allocation wired, publishing actuator_motors/actuator_servos");
 	PX4_INFO("armed=%d", _vehicle_control_mode.flag_armed);
 	PX4_INFO("F_b = [%.3f, %.3f, %.3f] N (body/FRD)", (double)_F_b(0), (double)_F_b(1), (double)_F_b(2));
 	PX4_INFO("M_b = [%.4f, %.4f, %.4f] N*m (body/FRD)", (double)_M_b(0), (double)_M_b(1), (double)_M_b(2));
-	PX4_INFO("open items: output/integrator-limit bounds are +/-infinity (anti-windup inert) until 4d; "
-		 "EKF reset-counter adjustment not implemented; integrator reset handles disarm only, "
-		 "not \"mode entry\" (this module has no PX4 flight-mode concept)");
+	PX4_INFO("F1=%.3f N F2=%.3f N  alpha1=%.4f alpha2=%.4f rad  beta1=%.4f beta2=%.4f rad  saturated=%d",
+		 (double)_alloc_out.F1, (double)_alloc_out.F2,
+		 (double)_alloc_out.alpha1, (double)_alloc_out.alpha2,
+		 (double)_alloc_out.beta1, (double)_alloc_out.beta2,
+		 _alloc_out.saturated);
+	PX4_INFO("allocation Minv valid (derived from M0 at init): %d", _allocation.isValid());
+	PX4_INFO("open items (see .claude/plans/step-4e-allocation-plan.md): wrench sign/frame convention "
+		 "vs allocation.md's +Z-positive thrust is RESOLVED (frdToAllocatorFlu(), see class comment); "
+		 "fold (alpha) is pinned to 0, no lateral thrust-vectoring authority yet; "
+		 "control_allocator (stock) is no longer started for this airframe (4026_gz_foldrotor3 "
+		 "overrides VEHICLE_TYPE to \"none\"), so this module is the sole publisher of "
+		 "actuator_motors/actuator_servos; newtons->normalized motor mapping is unverified against "
+		 "Gazebo (bench test required before free flight); output-limit bounds are +/-infinity "
+		 "(conditional-integration anti-windup still inert); FR_VEL_Z_I_LIM=3.0N bounds the Z "
+		 "integrator directly (RESOLVED 2026-09-09), X/Y integrator still unbounded; EKF "
+		 "reset-counter adjustment not implemented; integrator reset handles disarm only, not "
+		 "\"mode entry\"");
 
 	return 0;
 }
@@ -296,14 +500,24 @@ mc_att_control, mc_rate_control, and control_allocator for this vehicle
 only — those modules are not started for this airframe, and are not
 modified by this module's existence.
 
-Status: step 4e part 1 of the implementation plan (see .claude/specs/
-controller.md, controller_params.md). The full position/velocity/
-attitude/rate cascade is wired into Run() and computes a wrench
-(F_b, M_b) every cycle -- `status` prints it. Allocation (step 4d) does
-not exist yet and NOTHING IS PUBLISHED to actuator_motors/
-actuator_servos; this module is inert at the actuator boundary. The
-stock mc_pos_control/mc_att_control/mc_rate_control stack is unaffected
-by this module running.
+Status: step 4e part 2 of the implementation plan (see .claude/specs/
+controller.md, controller_params.md, allocation.md, and
+.claude/plans/step-4e-allocation-plan.md). The full position/velocity/
+attitude/rate cascade is wired into Run(), computes a wrench (F_b, M_b)
+every cycle, allocates it (FoldrotorAllocation, step 4d), converts it
+into the allocator's FLU convention (frdToAllocatorFlu(), the wrench
+sign/frame resolution) and publishes actuator_motors/actuator_servos
+every cycle -- `status` prints the allocated commands and every open
+item. This is now the sole publisher of those topics for this airframe:
+4026_gz_foldrotor3 no longer sets VEHICLE_TYPE mc, so the stock
+mc_pos_control/mc_att_control/mc_rate_control/control_allocator stack is
+not started for this vehicle (those modules themselves are unmodified
+and still start normally for any other airframe).
+
+UNRESOLVED before any free-flight attempt: the newtons->normalized motor
+mapping against Gazebo -- must be confirmed by a bench-context check
+(module armed, not flying) before closed-loop hover, per
+.claude/CLAUDE.md's verification-before-validation order.
 
 )DESCR_STR");
 
