@@ -2,20 +2,51 @@
  *
  * foldrotor_control — Inertial2Body force-path rotation stage (step 4b).
  *
- * Fixes the defect recorded in .claude/specs/controller.md, "Identified
- * issues (confirmed) → 1. Missing inertial→body rotation on the force
- * path": the velocity loop produces a desired force in the inertial/NED
- * frame, but Control_Alloc's Fx_d/Fy_d/Fz_d inputs are body-frame
- * (allocation.md Interface). Nothing rotated between the two.
+ * REWORKED (2026-09-21 (7)) to the FULL body<-NED rotation, taken directly
+ * from the attitude quaternion's DCM. This reverses the 2026-09-17 change
+ * to a yaw-only rotation, which was wrong, and restores the full rotation
+ * the stage originally had -- but by a route that has no singularity.
  *
- * Scope is deliberately just the rotation. The position/velocity PID that
- * will produce F_i (step 4a), the attitude/rate PID (4c), the allocator
- * (4d), and the wiring into FoldrotorControl::Run() (4e) are separate
- * diffs — this header depends on none of them, and on no uORB topic.
+ * WHY THE YAW-ONLY VERSION WAS WRONG. Its premise was "this vehicle
+ * translates by independent per-rotor thrust vectoring, not by leaning the
+ * body, so assume level." The first half is true and the conclusion does
+ * not follow. Assuming level does not make the vehicle level: it makes the
+ * controller BLIND to the roll/pitch it actually has. The velocity loop
+ * asks for a force in NED -- mostly the ~15.3 N holding the vehicle up --
+ * and a yaw-only rotation hands that straight to the allocator as though
+ * body-down and NED-down were the same axis. They are not, whenever the
+ * vehicle is tilted, and the thrust that was meant to point up then points
+ * up-and-sideways in the inertial frame.
+ *
+ * That error is not small and it is not self-correcting. Measured in SITL
+ * (findings.md 2026-09-21 (7)): a sustained 22 deg of pitch turned
+ * ~17 N of commanded lift into ~6.4 N of uncommanded NED-horizontal force
+ * -- against the 1.0 N the position loop is permitted to answer with
+ * (kPosVelForceXYLimit). The loop saturates its horizontal authority
+ * instantly and loses by a factor of six, every cycle, in whatever
+ * direction the vehicle happens to be leaning. The vehicle climbed to
+ * altitude and then departed 272 m downrange in 14 s.
+ *
+ * The full rotation removes this entirely: F_b = R^T * F_i means the
+ * delivered inertial force is R * F_b = F_i, at ANY attitude. This is
+ * exactly the property a fully-actuated vehicle is supposed to have, and
+ * it is why the "not transferable from mc_pos_control" note in
+ * reference/px4-module-patterns.md applies to the attitude SETPOINT
+ * synthesis (thrustToAttitude/limitTilt) and not to this rotation.
+ * mc_pos_control has no equivalent of this stage precisely because its
+ * vehicle cannot use one.
+ *
+ * NO SINGULARITY, unlike the pre-2026-09-17 full-Euler version. That one
+ * reconstructed a rotation matrix from phi/theta/psi and so inherited the
+ * 3-2-1 gimbal lock at pitch = +/-90 deg that controller.md and
+ * controller_params.md both carry as an open concern. This takes the DCM
+ * from the quaternion directly and never forms an Euler triple, so the
+ * concern does not apply -- the concern was always about the
+ * PARAMETERIZATION, not about using the full attitude.
  *
  * The moment path (Mx_b, My_b, Mz_b) is NOT rotated here and needs no
  * rotation: p/q/r and the body moments are body-frame by convention
- * already (controller.md).
+ * already (controller.md). Unaffected.
  *
  ****************************************************************************/
 
@@ -27,70 +58,28 @@ namespace foldrotor
 {
 
 /**
- * Rt: the inertial → body rotation, i.e. the transpose of the standard
- * ZYX (3-2-1 intrinsic Tait-Bryan) body → inertial DCM.
+ * Rotate a desired force from the inertial/NED frame into the body/FRD
+ * frame: F_b = R_ned_to_body * F_i.
  *
- * Transcribed verbatim from controller.md's MATLAB reference:
- *
- *   Rt = [ cpsi*cth,                  spsi*cth,                 -sth;
- *          cpsi*sth*sphi - spsi*cphi, spsi*sth*sphi + cpsi*cphi, cth*sphi;
- *          cpsi*sth*cphi + spsi*sphi, spsi*sth*cphi - cpsi*sphi, cth*cphi ];
- *
- * This is the same convention step 3's quaternion→Euler conversion
- * already produces (FoldrotorControl.cpp: matrix::Eulerf(matrix::Quatf(q))),
- * so it composes with _euler without adaptation. It is also exactly
- * matrix::Dcmf(euler).transpose() — PX4's Dcm(const Euler&) constructor
- * (src/lib/matrix/matrix/Dcm.hpp) builds the same standard ZYX matrix.
- * That equivalence is asserted in FoldrotorControlTest.cpp rather than
- * assumed, and it is why controller.md's "standard ZYX" claim holds.
- *
- * The literal transcription is kept (instead of just calling
- * matrix::Dcmf(euler).transpose()) so this stage stays line-by-line
- * traceable to the Simulink/MATLAB reference that is the source of truth
- * for the math — the library equivalence is a cross-check on the
- * transcription, not a substitute for it.
- *
- * @param euler current *estimated* attitude (not the setpoint —
- *              controller.md is explicit about this), ZYX phi/theta/psi
- * @return 3x3 rotation taking an inertial/NED vector to body/FRD
+ * @param F_i          desired force, inertial/NED (the velocity loop's output)
+ * @param R_ned_to_body  transpose of vehicle_attitude.q's DCM, i.e. the
+ *                     NED -> body/FRD rotation. Passed in rather than
+ *                     derived here so the caller does the quaternion
+ *                     conversion once per cycle.
+ * @return desired force in body/FRD, as allocation.md's Interface requires
  */
-inline matrix::Dcmf inertialToBodyRotation(const matrix::Eulerf &euler)
+inline matrix::Vector3f inertialToBody(const matrix::Vector3f &F_i, const matrix::Dcmf &R_ned_to_body)
 {
-	const float cphi = std::cos(euler.phi());
-	const float sphi = std::sin(euler.phi());
-	const float cth  = std::cos(euler.theta());
-	const float sth  = std::sin(euler.theta());
-	const float cpsi = std::cos(euler.psi());
-	const float spsi = std::sin(euler.psi());
-
-	matrix::Dcmf Rt;
-
-	Rt(0, 0) = cpsi * cth;
-	Rt(0, 1) = spsi * cth;
-	Rt(0, 2) = -sth;
-
-	Rt(1, 0) = cpsi * sth * sphi - spsi * cphi;
-	Rt(1, 1) = spsi * sth * sphi + cpsi * cphi;
-	Rt(1, 2) = cth * sphi;
-
-	Rt(2, 0) = cpsi * sth * cphi + spsi * sphi;
-	Rt(2, 1) = spsi * sth * cphi - cpsi * sphi;
-	Rt(2, 2) = cth * cphi;
-
-	return Rt;
+	return R_ned_to_body * F_i;
 }
 
 /**
- * Rotate a desired force from the inertial/NED frame into the body/FRD
- * frame: F_b = Rt * F_i.
- *
- * @param F_i desired force, inertial/NED (the velocity loop's output)
- * @param euler current estimated attitude, ZYX phi/theta/psi
- * @return desired force in body/FRD, as allocation.md's Interface requires
+ * Convenience overload taking the attitude quaternion (body -> NED, as
+ * vehicle_attitude.q is defined). Transposes it internally.
  */
-inline matrix::Vector3f inertialToBody(const matrix::Vector3f &F_i, const matrix::Eulerf &euler)
+inline matrix::Vector3f inertialToBody(const matrix::Vector3f &F_i, const matrix::Quatf &q_body_to_ned)
 {
-	return inertialToBodyRotation(euler) * F_i;
+	return matrix::Dcmf(q_body_to_ned).transpose() * F_i;
 }
 
 } // namespace foldrotor

@@ -7,8 +7,31 @@
 
 . ${R}etc/init.d/rc.mc_defaults
 
+# rc.mc_defaults sets VEHICLE_TYPE mc, which would make rc.vehicle_setup
+# source rc.mc_apps and start the stock mc_pos_control/mc_att_control/
+# mc_rate_control/control_allocator stack. foldrotor_control (started
+# below) replaces that whole stack for this vehicle -- see system.md
+# "Module scope (decided)" -- and control_allocator racing
+# foldrotor_control to publish actuator_motors/actuator_servos was
+# tracked as allocation.md/plan open item O-4. Overriding back to "none"
+# here keeps rc.mc_defaults' other params (MAV_TYPE, IMU_GYRO_RATEMAX,
+# RTL_*_ALT, EKF2_RNG_FOG) without pulling in rc.mc_apps; land_detector,
+# the one rc.mc_apps line commander/arming actually needs, is started
+# explicitly below instead. EKF2/commander/sensors are unconditional in
+# rcS and unaffected by this.
+set VEHICLE_TYPE none
+
 PX4_SIMULATOR=${PX4_SIMULATOR:=gz}
-PX4_GZ_WORLD=${PX4_GZ_WORLD:=default}
+# 'foldrotor', not 'default': the stock world runs ODE at
+# max_step_size 0.004 (250 Hz), which makes the rate loop run at
+# dt = 4 ms rather than the ~1 kHz foldrotor_control is designed and
+# documented for. At 250 Hz the rate loop's acceleration-feedback term
+# (-D*rate_dot, with rate_dot low-passed at IMU_DGYRO_CUTOFF) has a
+# closed-loop pole of -1.93 on BOTH roll and pitch -- sign-alternating
+# divergence, which is what flipped the vehicle. See findings.md
+# 2026-09-21 (2). Tools/simulation/gz/worlds/foldrotor.sdf is the stock
+# default world with the physics block at 0.001 / 1000 Hz.
+PX4_GZ_WORLD=${PX4_GZ_WORLD:=foldrotor}
 PX4_SIM_MODEL=${PX4_SIM_MODEL:=foldrotor3}
 
 param set-default SIM_GZ_EN 1
@@ -61,3 +84,40 @@ param set-default SIM_GZ_SV_MAXA4 45.26
 
 param set-default MPC_THR_HOVER 0.6
 param set-default NAV_DLL_ACT 2
+
+# rc.mc_apps is not sourced for this vehicle (VEHICLE_TYPE overridden to
+# "none" above), so the two non-controller lines it would otherwise
+# provide are started explicitly here instead. (checked rc.mc_apps in
+# full: the rest of it is mc_pos_control/mc_att_control/mc_rate_control/
+# control_allocator plus mc_hover_thrust_estimator/vision_target_
+# estimator/mc_autotune_attitude_control/mc_nn_control/mc_raptor, all of
+# which either are the stock controller stack or exist purely to serve
+# it -- none of which this vehicle's own module needs. EKF2/sensors/
+# commander are unconditional in rcS and unaffected by VEHICLE_TYPE.)
+land_detector start multicopter
+
+# flight_mode_manager -- checked (not assumed): it depends only on
+# vehicle_control_mode/vehicle_status/vehicle_land_detected/
+# vehicle_local_position/vehicle_command, not on mc_pos_control being
+# alive, so it runs standalone here exactly as it would alongside the
+# stock stack. It is foldrotor_control's only legitimate
+# trajectory_setpoint source (FoldrotorControl.hpp/.cpp: this module has
+# no flight-mode concept of its own, decided step 4e part 1 -- it always
+# runs the same cascade on whatever trajectory_setpoint says, and was
+# never meant to synthesize that setpoint itself). Without this,
+# trajectory_setpoint has no publisher and foldrotor_control reads a
+# stale zero-initialized struct instead -- see controller.md's Open
+# question 6 and findings.md's 2026-09-09 entry for the SITL symptom
+# this caused (attitude failsafe within ~1s of arming). One caveat
+# carried forward, not fixed here: takeoff_status is also mc_pos_control-
+# only, so flight_mode_manager's internal takeoff state never advances
+# past TAKEOFF_STATE_UNINITIALIZED, and it re-activates (snapshots
+# current position/velocity as the setpoint) every cycle rather than
+# ever tracking a moving command -- a hold-in-place setpoint, sufficient
+# for Part D's bench sequence but not for translation. Recorded in
+# controller.md, not silently relied upon.
+flight_mode_manager start
+
+# foldrotor_control replaces the stock position/attitude/rate/allocation
+# stack for this vehicle -- see system.md "Module scope (decided)".
+foldrotor_control start

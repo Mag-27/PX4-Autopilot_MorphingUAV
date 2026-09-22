@@ -15,17 +15,21 @@
  *
  * foldrotor_control — step 4a tests:
  *  4) PositionVelocityControl: position P -> velocity PID -> inertial
- *     desired force (controller.md "Structure (confirmed from
- *     Simulink)"), at the exact gains in controller_params.md's table.
- *     Every expected value below is derived by hand from those gains
- *     and written out in the comment above its assertion — not read
- *     back off the implementation. Covers the four semantics decisions
- *     recorded in findings.md ("Velocity-loop semantics resolved by
- *     user decision (step 4a)"): FF-as-P, derivative-on-measurement,
- *     conditional-integration anti-windup, and the gravity feedforward
- *     (15.260017 N, the measured hover weight, since the 2026-09-09
- *     under-scaling fix — was 9.81 before). Pure math — no Gazebo, no
- *     uORB.
+ *     desired force, at the exact gains in controller_params.md's table.
+ *     REWORKED 2026-09-17 to mirror mc_pos_control's PositionControl
+ *     structure (see PositionVelocityControl.hpp's header comment and
+ *     .claude/plans/read-mc-pos-contorl-and-can-greedy-pearl.md) — a
+ *     deliberate, recorded departure from the Simulink-derived structure
+ *     for this loop's saturation/anti-windup MECHANISM only; the gains
+ *     are unchanged. Every expected value below is derived by hand from
+ *     those gains and written out in the comment above its assertion —
+ *     not read back off the implementation. Covers FF-as-P,
+ *     derivative-on-measurement, the gravity feedforward (15.260017 N,
+ *     the measured hover weight), and the post-rework anti-windup split:
+ *     Z keeps conditional-integration freezing (now against a dynamic
+ *     sphere bound); X/Y now use Rundqwist tracking anti-windup instead
+ *     of the old uniform conditional-integration freeze. Pure math — no
+ *     Gazebo, no uORB.
  *
  * foldrotor_control — step 4c tests:
  *  5) AttitudeRateControl: attitude P -> rate PID -> body moments
@@ -114,28 +118,58 @@ struct ExpectedParam {
 };
 
 // One entry per row in controller_params.md's parameter table.
+// D gains zeroed 2026-09-22. With the derivative taken on the
+// MEASUREMENT against a plant I*rate_dot = M, the D term collects as
+// (I + D)*rate_dot = FF*e_r -- synthetic inertia, not damping (see
+// foldrotor_control_params.yaml and findings.md 2026-09-22 (13)).
+// D/I was 13%/7%/19% for roll/pitch/yaw, negligible at the 0.36-0.62
+// Hz loop bandwidths, but D's gain rises with frequency and it
+// supplied the bulk of the commanded moment at the 18.8 Hz actuator
+// limit cycle.
 const ExpectedParam kExpectedParams[] = {
-	{px4::params::FR_POS_P, 3.0f},
+	{px4::params::FR_POS_P, 0.4f},
 
-	{px4::params::FR_VEL_XY_FF, 6.0f},
-	{px4::params::FR_VEL_XY_I, 1.0f},
-	{px4::params::FR_VEL_XY_D, 1.0f},
+	{px4::params::FR_VEL_XY_FF, 1.0f},
+	{px4::params::FR_VEL_XY_I, 0.2f},
+	{px4::params::FR_VEL_XY_D, 0.0f},
 
 	{px4::params::FR_VEL_Z_FF, 7.0f},
 	{px4::params::FR_VEL_Z_I, 7.0f},
-	{px4::params::FR_VEL_Z_D, 0.1f},
+	{px4::params::FR_VEL_Z_D, 0.0f},
 	{px4::params::FR_VEL_Z_GRAV_FF, 15.260017f},
 	{px4::params::FR_VEL_Z_I_LIM, 3.0f},
 
-	{px4::params::FR_ATT_P, 3.0f},
+	{px4::params::FR_VEL_XY_I_LIM, 0.3f},
 
-	{px4::params::FR_RATE_RP_FF, 3.5f},
-	{px4::params::FR_RATE_RP_I, 0.1f},
-	{px4::params::FR_RATE_RP_D, 0.5f},
+	{px4::params::FR_VEL_XY_MAX, 1.0f},
+	{px4::params::FR_VEL_Z_MAX_UP, 0.3f},
+	{px4::params::FR_VEL_Z_MAX_DN, 0.7f},
 
-	{px4::params::FR_RATE_YAW_FF, 2.5f},
+	{px4::params::FR_ATT_P, 2.0f},
+
+	{px4::params::FR_RATE_R_FF, 0.49f},
+	{px4::params::FR_RATE_R_I, 0.5f},
+	{px4::params::FR_RATE_R_D, 0.0f},
+	{px4::params::FR_RATE_R_I_LIM, 0.4f},
+
+	// Pitch is NOT roll's gain. Both are now sized directly from the
+	// MEASURED per-axis moment authority rather than scaled off each
+	// other -- FF = authority / linear_range, see findings.md
+	// 2026-09-21 (6) and foldrotor_control_params.yaml's descriptions.
+	{px4::params::FR_PITCH_LEVER, 0.0f},
+	{px4::params::FR_RATE_P_FF, 0.11f},
+	{px4::params::FR_RATE_P_I, 0.112f},
+	{px4::params::FR_RATE_P_D, 0.0f},
+	{px4::params::FR_RATE_P_I_LIM, 0.05f},
+
+	{px4::params::FR_RATE_YAW_FF, 0.62f},
 	{px4::params::FR_RATE_YAW_I, 0.0f},
 	{px4::params::FR_RATE_YAW_D, 0.0f},
+
+	// Command-path bandwidth limit, 2026-09-22. Not a gain: the corner
+	// of the first-order low-pass on the commanded wrench, sized between
+	// the loop bandwidths (<=0.62 Hz) and the actuator poles (>=6.1 Hz).
+	{px4::params::FR_WRENCH_LP, 5.0f},
 };
 
 } // namespace
@@ -244,7 +278,10 @@ TEST(FoldrotorControlQuaternionToEulerTest, NearPitchSingularityStaysFiniteAndRo
 // ---------------------------------------------------------------------------
 // Step 4b: Inertial2Body force-path rotation
 // (controller.md, "Identified issues (confirmed) -> 1. Missing
-// inertial->body rotation on the force path").
+// inertial->body rotation on the force path"). REWORKED 2026-09-17 from
+// the full 3-2-1 Euler rotation to a yaw-only 2D rotation, alongside
+// PositionVelocityControl's mc_pos_control-structure rework -- see
+// Inertial2Body.hpp's header comment.
 //
 // Pure math -- no uORB, no module instantiation, no Gazebo, same category
 // as the quaternion singularity tests above.
@@ -288,48 +325,123 @@ void expectProperRotation(const matrix::Dcmf &Rt, const char *context)
 
 TEST(FoldrotorControlInertial2BodyTest, LevelAttitudeIsIdentity)
 {
-	// controller.md's explanation of why the missing rotation has not shown
-	// up in testing: "Near level (phi,theta,psi ~ 0), inertial ~ body". At
-	// exactly level it must be an identity, so inserting this stage cannot
-	// change any existing near-level result.
-	const matrix::Eulerf level(0.f, 0.f, 0.f);
+	// At exactly level the stage must be an identity, so inserting it
+	// cannot change any existing near-level result.
+	const matrix::Quatf level(matrix::Eulerf(0.f, 0.f, 0.f));
 	const matrix::Vector3f F_i(3.f, -4.f, 5.f);
 
 	const matrix::Vector3f F_b = foldrotor::inertialToBody(F_i, level);
 
-	EXPECT_FLOAT_EQ(F_b(0), F_i(0));
-	EXPECT_FLOAT_EQ(F_b(1), F_i(1));
-	EXPECT_FLOAT_EQ(F_b(2), F_i(2));
+	EXPECT_NEAR(F_b(0), F_i(0), 1e-5f);
+	EXPECT_NEAR(F_b(1), F_i(1), 1e-5f);
+	EXPECT_NEAR(F_b(2), F_i(2), 1e-5f);
 
-	expectProperRotation(foldrotor::inertialToBodyRotation(level), "level attitude");
+	expectProperRotation(matrix::Dcmf(level).transpose(), "level attitude");
 }
 
-TEST(FoldrotorControlInertial2BodyTest, IsAProperRotationAtNonTrivialAttitude)
+// THE regression test for 2026-09-21 (7). Roll and pitch must NOT be
+// ignored: a tilted vehicle asking for NED-vertical lift must receive a
+// body-frame force that is tilted the opposite way, so that the delivered
+// inertial force is still vertical.
+//
+// The yaw-only stage this replaces returned F_i unchanged here, which is
+// what silently converted lift into sideways thrust and flew the vehicle
+// 272 m downrange. The final assertion is the size of that defect.
+TEST(FoldrotorControlInertial2BodyTest, PitchIsNotIgnored)
 {
-	expectProperRotation(foldrotor::inertialToBodyRotation(matrix::Eulerf(0.f, 0.f, 0.f)),
-			     "level attitude");
-	expectProperRotation(foldrotor::inertialToBodyRotation(matrix::Eulerf(0.4f, -0.3f, 1.1f)),
-			     "phi=0.4 theta=-0.3 psi=1.1");
-	expectProperRotation(foldrotor::inertialToBodyRotation(matrix::Eulerf(-1.2f, 0.9f, -2.5f)),
-			     "phi=-1.2 theta=0.9 psi=-2.5");
+	// Nose up 22 deg (the sustained pitch measured in SITL), no roll/yaw.
+	const float theta = math::radians(22.f);
+	const matrix::Quatf tilted(matrix::Eulerf(0.f, theta, 0.f));
+
+	// Hover lift: NED z is DOWN-positive, so "up" is negative.
+	const matrix::Vector3f F_i(0.f, 0.f, -15.26f);
+	const matrix::Vector3f F_b = foldrotor::inertialToBody(F_i, tilted);
+
+	// R_ned_to_body for a pure pitch theta maps (0,0,-Fz) to
+	// (Fz*sin(theta), 0, -Fz*cos(theta)).
+	EXPECT_NEAR(F_b(0), 15.26f * std::sin(theta), 1e-4f);
+	EXPECT_NEAR(F_b(1), 0.f, 1e-4f);
+	EXPECT_NEAR(F_b(2), -15.26f * std::cos(theta), 1e-4f);
+
+	// Round trip: rotating back must reproduce the commanded inertial
+	// force exactly. This is the property the whole stage exists for and
+	// the one the yaw-only version did not have.
+	const matrix::Vector3f back = matrix::Dcmf(tilted) * F_b;
+	EXPECT_NEAR(back(0), F_i(0), 1e-4f);
+	EXPECT_NEAR(back(1), F_i(1), 1e-4f);
+	EXPECT_NEAR(back(2), F_i(2), 1e-4f);
+
+	// Size of the defect: the yaw-only stage was an identity at zero yaw,
+	// so it would have handed F_i straight through, and the vehicle would
+	// have delivered R*F_i -- leaving this much uncommanded NED-horizontal
+	// force. Compare against kPosVelForceXYLimit, the authority the
+	// position loop has to fight it with.
+	const matrix::Vector3f delivered_by_yaw_only = matrix::Dcmf(tilted) * F_i;
+	const float stray_horizontal = matrix::Vector2f(delivered_by_yaw_only(0),
+				       delivered_by_yaw_only(1)).norm();
+	EXPECT_GT(stray_horizontal, 5.f * FoldrotorControl::kPosVelForceXYLimit)
+			<< "the yaw-only stage leaked " << stray_horizontal
+			<< " N of horizontal force at 22 deg of pitch";
+}
+
+TEST(FoldrotorControlInertial2BodyTest, RollIsNotIgnored)
+{
+	const float phi = math::radians(30.f);
+	const matrix::Quatf rolled(matrix::Eulerf(phi, 0.f, 0.f));
+
+	const matrix::Vector3f F_i(0.f, 0.f, -15.26f);
+	const matrix::Vector3f F_b = foldrotor::inertialToBody(F_i, rolled);
+
+	// Pure roll phi maps (0,0,-Fz) to (0, -Fz*sin(phi), -Fz*cos(phi)).
+	EXPECT_NEAR(F_b(0), 0.f, 1e-4f);
+	EXPECT_NEAR(F_b(1), -15.26f * std::sin(phi), 1e-4f);
+	EXPECT_NEAR(F_b(2), -15.26f * std::cos(phi), 1e-4f);
+}
+
+TEST(FoldrotorControlInertial2BodyTest, IsAProperRotationAtAnyAttitude)
+{
+	const float angles[][3] = {
+		{0.f, 0.f, 0.f}, {0.f, 0.f, 1.1f}, {0.f, 0.f, -2.5f},
+		{0.4f, -0.3f, 0.7f}, {1.2f, 0.9f, -2.0f}, {-1.5f, 1.4f, 3.0f},
+	};
+
+	for (const auto &a : angles) {
+		const matrix::Dcmf Rt = matrix::Dcmf(matrix::Quatf(matrix::Eulerf(a[0], a[1], a[2]))).transpose();
+		expectProperRotation(Rt, "attitude sweep");
+	}
+}
+
+// No singularity at pitch = +/-90 deg. The pre-2026-09-17 full-Euler
+// version reconstructed the rotation from phi/theta/psi and so inherited
+// 3-2-1 gimbal lock there; controller.md and controller_params.md both
+// still carry that as an open concern. Taking the DCM from the quaternion
+// removes it -- the concern was about the PARAMETERIZATION, not about
+// using the full attitude.
+TEST(FoldrotorControlInertial2BodyTest, NoSingularityAtNinetyDegreePitch)
+{
+	for (float theta : {math::radians(89.9f), math::radians(90.f), math::radians(-90.f)}) {
+		const matrix::Quatf q(matrix::Eulerf(0.f, theta, 0.7f));
+		const matrix::Vector3f F_b = foldrotor::inertialToBody(matrix::Vector3f(0.f, 0.f, -15.26f), q);
+
+		EXPECT_TRUE(std::isfinite(F_b(0)) && std::isfinite(F_b(1)) && std::isfinite(F_b(2)))
+				<< "non-finite force at theta = " << theta;
+		EXPECT_NEAR(F_b.norm(), 15.26f, 1e-3f) << "rotation changed the magnitude at theta = " << theta;
+
+		expectProperRotation(matrix::Dcmf(q).transpose(), "90 deg pitch");
+	}
 }
 
 TEST(FoldrotorControlInertial2BodyTest, PureYawMatchesHandComputedRotation)
 {
-	// THE regime controller.md says the bug surfaces in: "sustained yaw
-	// during translation". At psi = +90 deg, phi = theta = 0:
-	//
-	//   cpsi = 0, spsi = 1, cth = 1, sth = 0, cphi = 1, sphi = 0
-	//
-	// substituted into controller.md's Rt gives, by hand:
+	// Yaw behaviour is unchanged by the 2026-09-21 (7) rework and still
+	// matters: at psi = +90 deg, phi = theta = 0,
 	//
 	//   Rt = [  0  1  0 ]
 	//        [ -1  0  0 ]
 	//        [  0  0  1 ]
 	//
-	// so F_i = (3, 4, 5) -> F_b = (4, -3, 5). Derived independently from
-	// the spec's matrix, not read back out of the implementation.
-	const matrix::Eulerf yawed_90(0.f, 0.f, static_cast<float>(M_PI) / 2.f);
+	// so F_i = (3, 4, 5) -> F_b = (4, -3, 5).
+	const matrix::Quatf yawed_90(matrix::Eulerf(0.f, 0.f, static_cast<float>(M_PI) / 2.f));
 	const matrix::Vector3f F_i(3.f, 4.f, 5.f);
 
 	const matrix::Vector3f F_b = foldrotor::inertialToBody(F_i, yawed_90);
@@ -344,77 +456,25 @@ TEST(FoldrotorControlInertial2BodyTest, PureYawMatchesHandComputedRotation)
 	EXPECT_NEAR(north(0), 0.f, 1e-5f);
 	EXPECT_NEAR(north(1), -1.f, 1e-5f);
 	EXPECT_NEAR(north(2), 0.f, 1e-5f);
-
-	// And the magnitude of the defect this stage fixes: without the
-	// rotation, F_i was handed to the allocator as if it were body-frame.
-	// At 90 deg of yaw that is a full axis swap, not a small error -- the
-	// X and Y commands would be interchanged and one of them sign-flipped.
-	EXPECT_GT((F_b - F_i).norm(), 4.f);
-}
-
-TEST(FoldrotorControlInertial2BodyTest, PureYaw45MatchesHandComputedRotation)
-{
-	// psi = 45 deg, phi = theta = 0 -> Rt = [ c s 0; -s c 0; 0 0 1 ]
-	// with c = s = sqrt(2)/2, so F_i = (1, 0, 0) -> (sqrt(2)/2, -sqrt(2)/2, 0).
-	const float root_half = std::sqrt(2.f) / 2.f;
-	const matrix::Eulerf yawed_45(0.f, 0.f, static_cast<float>(M_PI) / 4.f);
-
-	const matrix::Vector3f F_b = foldrotor::inertialToBody(matrix::Vector3f(1.f, 0.f, 0.f), yawed_45);
-
-	EXPECT_NEAR(F_b(0), root_half, 1e-5f);
-	EXPECT_NEAR(F_b(1), -root_half, 1e-5f);
-	EXPECT_NEAR(F_b(2), 0.f, 1e-5f);
-}
-
-TEST(FoldrotorControlInertial2BodyTest, PureRollMatchesHandComputedRotation)
-{
-	// phi = +90 deg, theta = psi = 0 -> by hand from controller.md's Rt:
-	//
-	//   Rt = [ 1  0  0 ]
-	//        [ 0  0  1 ]
-	//        [ 0 -1  0 ]
-	//
-	// Rolled 90 deg right, the body Y axis points along inertial down, so a
-	// pure inertial-down force (0,0,1) becomes +Y in body: (0, 1, 0).
-	const matrix::Eulerf rolled_90(static_cast<float>(M_PI) / 2.f, 0.f, 0.f);
-
-	const matrix::Vector3f F_b = foldrotor::inertialToBody(matrix::Vector3f(0.f, 0.f, 1.f), rolled_90);
-
-	EXPECT_NEAR(F_b(0), 0.f, 1e-5f);
-	EXPECT_NEAR(F_b(1), 1.f, 1e-5f);
-	EXPECT_NEAR(F_b(2), 0.f, 1e-5f);
 }
 
 TEST(FoldrotorControlInertial2BodyTest, MatchesPx4DcmTransposeAcrossAttitudes)
 {
-	// controller.md claims its Rt is the "standard ZYX (yaw-pitch-roll)"
-	// inertial->body rotation. PX4's own Dcm(const Euler&) constructor
-	// (src/lib/matrix/matrix/Dcm.hpp) builds the standard 3-2-1 intrinsic
-	// Tait-Bryan body->inertial DCM, so the claim is equivalent to
-	//   Rt == matrix::Dcmf(euler).transpose()
-	// across all attitudes. Asserting it here does two jobs: it checks the
-	// spec's claim is true rather than assumed, and it proves this stage
-	// composes with step 3's _euler = matrix::Eulerf(matrix::Quatf(q))
-	// without any convention adaptation -- which is what step 4e relies on.
-	const matrix::Eulerf attitudes[] = {
-		matrix::Eulerf(0.f, 0.f, 0.f),
-		matrix::Eulerf(0.4f, -0.3f, 1.1f),
-		matrix::Eulerf(-1.2f, 0.9f, -2.5f),
-		matrix::Eulerf(0.f, 0.f, static_cast<float>(M_PI) / 2.f),
-		matrix::Eulerf(static_cast<float>(M_PI) / 2.f, 0.f, 0.f),
-		matrix::Eulerf(0.15f, 1.4f, 3.0f),
+	// Confirms the stage is exactly PX4's own standard DCM transpose, not
+	// an independently hand-rolled rotation.
+	const float angles[][3] = {
+		{0.f, 0.f, 0.f}, {0.6f, -0.3f, 0.4f}, {0.f, 0.f, -1.1f},
+		{0.2f, 1.0f, static_cast<float>(M_PI) / 2.f}, {-0.8f, -0.5f, 3.0f},
 	};
 
-	for (const matrix::Eulerf &euler : attitudes) {
-		const matrix::Dcmf Rt = foldrotor::inertialToBodyRotation(euler);
-		const matrix::Dcmf expected = matrix::Dcmf(euler).transpose();
+	for (const auto &a : angles) {
+		const matrix::Quatf q(matrix::Eulerf(a[0], a[1], a[2]));
+		const matrix::Vector3f F_i(3.f, -4.f, 5.f);
+		const matrix::Vector3f got = foldrotor::inertialToBody(F_i, q);
+		const matrix::Vector3f expected = matrix::Dcmf(q).transpose() * F_i;
 
 		for (int i = 0; i < 3; i++) {
-			for (int j = 0; j < 3; j++) {
-				EXPECT_NEAR(Rt(i, j), expected(i, j), 1e-5f)
-						<< "mismatch at (" << i << "," << j << ") for phi=" << euler.phi()
-						<< " theta=" << euler.theta() << " psi=" << euler.psi();
-			}
+			EXPECT_NEAR(got(i), expected(i), 1e-5f) << "component " << i;
 		}
 	}
 }
@@ -453,7 +513,9 @@ constexpr float kTol = 1e-4f;
 //   e_v   = v_sp - vel = (6-0.5, -3-0.25, 0-0)    = (5.5, -3.25, 0)
 //   Fx    = 6 * 5.5                               =  33.0
 //   Fy    = 6 * (-3.25)                           = -19.5
-//   Fz    = 7 * 0 + 0 (integral) - 0.1 * 0 + 15.260017 = 15.260017
+//   Fz    = 7 * 0 + 0 (integral) - 0.1 * 0 - 15.260017 = -15.260017
+//   (grav_ff SUBTRACTED, not added -- sign flipped 2026-09-11,
+//   PositionVelocityControl.hpp OPEN ITEM (b), REOPENED not resolved)
 // The integral contributes nothing on the first call, so this isolates
 // the position P stage and the velocity P stage together.
 TEST(FoldrotorPositionVelocityControlTest, NominalXYMatchesHandComputedCascade)
@@ -468,7 +530,7 @@ TEST(FoldrotorPositionVelocityControlTest, NominalXYMatchesHandComputedCascade)
 
 	EXPECT_NEAR(F(0), 33.0f, kTol);
 	EXPECT_NEAR(F(1), -19.5f, kTol);
-	EXPECT_NEAR(F(2), 15.260017f, kTol);
+	EXPECT_NEAR(F(2), -15.260017f, kTol);
 
 	// And the integral advanced by I * e_v * dt, per axis:
 	//   x: 1 *  5.50 * 0.01 =  0.055
@@ -480,12 +542,17 @@ TEST(FoldrotorPositionVelocityControlTest, NominalXYMatchesHandComputedCascade)
 }
 
 // With everything at zero, the only output is the Z gravity feedforward,
-// and it appears on Z alone. This pins OPEN ITEM (b): the value is
-// positive, i.e. positive-down in NED, exactly as controller_params.md
-// records it. Magnitude is now the measured hover weight (15.260017 N,
-// resolved 2026-09-09; was 9.81 N before), per OPEN ITEM (a)'s fix. If
-// that sign is ever decided to be wrong, this test is the thing that must
-// change with it — deliberately, not silently.
+// and it appears on Z alone. This pins OPEN ITEM (b), REOPENED 2026-09-11
+// (PositionVelocityControl.hpp): FR_VEL_Z_GRAV_FF is a positive weight
+// measurement, but body FRD/NED is Z DOWN-positive, so a force opposing
+// gravity needs a NEGATIVE Z contribution -- the value is now negative,
+// not positive-down as this test previously asserted. Magnitude is still
+// the measured hover weight (15.260017 N, resolved 2026-09-09; was 9.81 N
+// before), per OPEN ITEM (a)'s fix -- only the sign of how it enters the
+// Z axis changed. Not re-verified against a bench pass (see the header
+// comment's OPEN ITEM (b) re-verification note) -- if that sign is ever
+// decided to be wrong again, this test is the thing that must change with
+// it — deliberately, not silently.
 TEST(FoldrotorPositionVelocityControlTest, GravityFeedforwardIsLiteralWeightOnZOnly)
 {
 	auto ctrl = makeSpecDefaultController();
@@ -495,13 +562,15 @@ TEST(FoldrotorPositionVelocityControlTest, GravityFeedforwardIsLiteralWeightOnZO
 
 	EXPECT_NEAR(F(0), 0.0f, kTol);
 	EXPECT_NEAR(F(1), 0.0f, kTol);
-	EXPECT_NEAR(F(2), 15.260017f, kTol);
+	EXPECT_NEAR(F(2), -15.260017f, kTol);
 }
 
 // Derivative acts on the measured velocity derivative, negated:
 //   Fx = -1.0 * 1 = -1.0
 //   Fy = -1.0 * 2 = -2.0
-//   Fz = -0.1 * 3 + 15.260017 = 14.960017
+//   Fz = -0.1 * 3 - 15.260017 = -15.560017
+//   (grav_ff SUBTRACTED -- sign flipped 2026-09-11, see
+//   NominalXYMatchesHandComputedCascade's comment)
 // Note the Z coefficient differs from X/Y (0.1 vs 1.0), which is why the
 // axes are checked separately rather than as one shared gain.
 TEST(FoldrotorPositionVelocityControlTest, DerivativeActsOnMeasurementAtPerAxisGains)
@@ -515,7 +584,7 @@ TEST(FoldrotorPositionVelocityControlTest, DerivativeActsOnMeasurementAtPerAxisG
 
 	EXPECT_NEAR(F(0), -1.0f, kTol);
 	EXPECT_NEAR(F(1), -2.0f, kTol);
-	EXPECT_NEAR(F(2), 14.960017f, kTol);
+	EXPECT_NEAR(F(2), -15.560017f, kTol);
 }
 
 // The discriminating test for derivative-on-measurement vs
@@ -559,11 +628,14 @@ TEST(FoldrotorPositionVelocityControlTest, IntegralAccumulatesAtXYGain)
 }
 
 // Z integral accumulation at FR_VEL_Z_I = 7 — the aggressive one — with
-// the gravity feedforward riding along, dt = 0.1, e_v = 3:
-//   call 1: Fz = 7*3 + 0.0 + 15.260017 = 36.260017 ; integral -> 7*3*0.1 = 2.1
-//   call 2: Fz = 7*3 + 2.1 + 15.260017 = 38.360017 ; integral -> 4.2
-//   call 3: Fz = 7*3 + 4.2 + 15.260017 = 40.460017 ; integral -> 6.3
-// (Integral accumulation itself does not depend on the feedforward value.)
+// the gravity feedforward riding along, dt = 0.1, e_v = 3. grav_ff is
+// SUBTRACTED, not added (sign flipped 2026-09-11, see
+// NominalXYMatchesHandComputedCascade's comment):
+//   call 1: Fz = 7*3 + 0.0 - 15.260017 =  5.739983 ; integral -> 7*3*0.1 = 2.1
+//   call 2: Fz = 7*3 + 2.1 - 15.260017 =  7.839983 ; integral -> 4.2
+//   call 3: Fz = 7*3 + 4.2 - 15.260017 =  9.939983 ; integral -> 6.3
+// (Integral accumulation itself does not depend on the feedforward value
+// or its sign -- getIntegral()(2) is unchanged from before the flip.)
 TEST(FoldrotorPositionVelocityControlTest, IntegralAccumulatesAtZGainWithGravityFeedforward)
 {
 	auto ctrl = makeSpecDefaultController();
@@ -571,9 +643,9 @@ TEST(FoldrotorPositionVelocityControlTest, IntegralAccumulatesAtZGainWithGravity
 	const matrix::Vector3f pos_sp(0.f, 0.f, 1.f);
 	const matrix::Vector3f zero;
 
-	EXPECT_NEAR(ctrl.update(zero, pos_sp, zero, zero, 0.1f)(2), 36.260017f, kTol);
-	EXPECT_NEAR(ctrl.update(zero, pos_sp, zero, zero, 0.1f)(2), 38.360017f, kTol);
-	EXPECT_NEAR(ctrl.update(zero, pos_sp, zero, zero, 0.1f)(2), 40.460017f, kTol);
+	EXPECT_NEAR(ctrl.update(zero, pos_sp, zero, zero, 0.1f)(2), 5.739983f, kTol);
+	EXPECT_NEAR(ctrl.update(zero, pos_sp, zero, zero, 0.1f)(2), 7.839983f, kTol);
+	EXPECT_NEAR(ctrl.update(zero, pos_sp, zero, zero, 0.1f)(2), 9.939983f, kTol);
 	EXPECT_NEAR(ctrl.getIntegral()(2), 6.3f, kTol);
 }
 
@@ -593,14 +665,18 @@ TEST(FoldrotorPositionVelocityControlTest, ResetIntegralClearsAccumulatedState)
 	EXPECT_NEAR(ctrl.getIntegral()(2), 0.0f, kTol);
 
 	// And a subsequent settled call returns to the bare gravity term.
+	// grav_ff SUBTRACTED, not added (sign flipped 2026-09-11, see
+	// NominalXYMatchesHandComputedCascade's comment).
 	const matrix::Vector3f F = ctrl.update(zero, zero, zero, zero, 0.1f);
 	EXPECT_NEAR(F(0), 0.0f, kTol);
-	EXPECT_NEAR(F(2), 15.260017f, kTol);
+	EXPECT_NEAR(F(2), -15.260017f, kTol);
 }
 
-// Default limits are +/-infinity, so nothing clamps and no anti-windup
-// engages. This is the runtime state until step 4d supplies real bounds,
-// and it is asserted here so that fact is visible rather than assumed.
+// Default limits are a huge ceiling with zero margin
+// (PositionVelocityControl.hpp's _lim_force_max/_lim_force_xy_margin
+// defaults, 2026-09-17 rework), so nothing clamps and no anti-windup
+// engages for any realistic test magnitude -- the same "no-op unless
+// configured" behavior the previous +/-infinity output-limit boxes gave.
 TEST(FoldrotorPositionVelocityControlTest, DefaultLimitsNeitherClampNorFreeze)
 {
 	auto ctrl = makeSpecDefaultController();
@@ -616,50 +692,80 @@ TEST(FoldrotorPositionVelocityControlTest, DefaultLimitsNeitherClampNorFreeze)
 	EXPECT_NEAR(ctrl.getIntegral()(0), 3.0f, kTol);
 }
 
-// Conditional integration, X axis. Limits +/-20 N; e_v = 6 gives an
-// unclamped Fx of 36, so the output saturates high while the error is
-// still positive -> the integrator must be frozen at zero for every one
-// of the five steps.
+// 2026-09-17 rework: X/Y no longer use conditional-integration freezing
+// (that mechanism now applies to Z only, mirroring mc_pos_control's own
+// asymmetric split -- see PositionVelocityControl.hpp decision 3). X/Y
+// instead use Rundqwist tracking anti-windup, which does NOT zero the
+// error outright; it tempers it by arw_gain*(desired - produced) so the
+// integrator keeps moving toward the equilibrium point that holds the
+// output exactly at the saturation boundary, rather than freezing at
+// zero (the old uniform-conditional-integration behavior) or winding up
+// unboundedly (DefaultLimitsNeitherClampNorFreeze's unbounded case).
 //
-// The integral is then read out two ways: directly, and by re-running
-// with the limits reopened and zero error, where the output IS the
-// integral (plus the Z gravity term). Contrast with
-// DefaultLimitsNeitherClampNorFreeze, which runs the identical sequence
-// unbounded and reaches 3.0.
-TEST(FoldrotorPositionVelocityControlTest, IntegratorFreezesWhileSaturatedX)
+// Setup: combined force limit 20 N, zero margin, zero gravity
+// feedforward (a fresh controller, not makeSpecDefaultController() --
+// isolates the X-axis geometry from Z's constant -15.260017 N offset,
+// which would otherwise eat into the sphere radius available to X).
+//
+// pos_sp = (2,0,0) held constant every call -> vel_sp = 6, e_v = 6
+// (vel and pos never change), so e_v is the same 6 every call; only the
+// integral term changes the unclamped Fx from call to call.
+//
+// Hand-derived recurrence (dt=0.1, FR_VEL_XY_FF=6, FR_VEL_XY_I=1,
+// arw_gain = 2/6 = 1/3):
+//   F_desired = 6*6 + I_prev = 36 + I_prev  (always > 20 here, so clamped)
+//   F_produced = 20                          (sphere radius, X-only)
+//   e_v_adjusted = 6 - (1/3)*(F_desired - F_produced)
+//                = 6 - (1/3)*(16 + I_prev) = (2 - I_prev)/3
+//   I_new = I_prev + 0.1*1*e_v_adjusted = I_prev*(29/30) + 1/15
+//
+//   I0 = 0
+//   I1 = 1/15                    = 0.0666667
+//   I2 = I1*29/30 + 1/15         = 0.1311111
+//   I3 = I2*29/30 + 1/15         = 0.1934074
+//
+// I climbs toward a finite fixed point (I* = 2, where e_v_adjusted = 0)
+// instead of freezing at 0 or growing without bound -- the output stays
+// pinned at the 20 N sphere edge every call regardless (scale always
+// renormalizes the clamped vector back to exactly the radius).
+TEST(FoldrotorPositionVelocityControlTest, TrackingAntiWindupDampensIntegrationWhileSaturatedX)
 {
-	auto ctrl = makeSpecDefaultController();
-	ctrl.setOutputLimits(matrix::Vector3f(-20.f, -20.f, -20.f),
-			     matrix::Vector3f(20.f, 20.f, 20.f));
+	foldrotor::PositionVelocityControl ctrl;
+	ctrl.setPositionGain(3.0f);
+	ctrl.setVelocityGains(6.0f, 1.0f, 1.0f, 7.0f, 7.0f, 0.1f);
+	ctrl.setForceLimits(20.f);
+	ctrl.setHorizontalForceMargin(0.f);
 
 	const matrix::Vector3f zero;
 	const matrix::Vector3f pos_sp(2.f, 0.f, 0.f);
 
-	for (int i = 0; i < 5; i++) {
-		// Output is clamped to the limit, not the unclamped 36.
-		EXPECT_NEAR(ctrl.update(zero, pos_sp, zero, zero, 0.1f)(0), 20.0f, kTol);
-	}
+	EXPECT_NEAR(ctrl.update(zero, pos_sp, zero, zero, 0.1f)(0), 20.0f, kTol);
+	EXPECT_NEAR(ctrl.getIntegral()(0), 0.0666667f, 1e-3f);
 
-	EXPECT_NEAR(ctrl.getIntegral()(0), 0.0f, kTol);
+	EXPECT_NEAR(ctrl.update(zero, pos_sp, zero, zero, 0.1f)(0), 20.0f, kTol);
+	EXPECT_NEAR(ctrl.getIntegral()(0), 0.1311111f, 1e-3f);
 
-	ctrl.setOutputLimits(matrix::Vector3f(-1e6f, -1e6f, -1e6f),
-			     matrix::Vector3f(1e6f, 1e6f, 1e6f));
-	const matrix::Vector3f probe = ctrl.update(zero, zero, zero, zero, 0.1f);
-	EXPECT_NEAR(probe(0), 0.0f, kTol);
+	EXPECT_NEAR(ctrl.update(zero, pos_sp, zero, zero, 0.1f)(0), 20.0f, kTol);
+	EXPECT_NEAR(ctrl.getIntegral()(0), 0.1934074f, 1e-3f);
 }
 
-// Same mechanism on Z, where FR_VEL_Z_I = 7 makes windup the real
-// concern. e_v = 3 gives an unclamped Fz of 7*3 + 15.260017 = 36.260017,
-// above the 20 N limit, so the integrator freezes at zero. Unbounded, the
-// same five steps would reach 7 * 3 * 0.1 * 5 = 10.5.
+// Z keeps the old conditional-integration mechanism exactly (decision 3),
+// just evaluated against the dynamic sphere bound instead of a static
+// box -- with X/Y at zero, the sphere bound collapses to exactly the
+// combined force limit, so this reproduces the pre-rework test's numbers
+// unchanged. grav_ff is SUBTRACTED (2026-09-11 sign fix, unaffected by
+// this rework): pos_sp_z = 2 gives e_v = 6, Fz = 7*6 - 15.260017 =
+// 26.739983, above the 20 N limit -- saturates high with a positive
+// error, so the integrator freezes at zero every step (unlike X/Y's
+// tracking ARW above, Z's freeze is a hard zero, not a tempered value).
 TEST(FoldrotorPositionVelocityControlTest, IntegratorFreezesWhileSaturatedZ)
 {
 	auto ctrl = makeSpecDefaultController();
-	ctrl.setOutputLimits(matrix::Vector3f(-20.f, -20.f, -20.f),
-			     matrix::Vector3f(20.f, 20.f, 20.f));
+	ctrl.setForceLimits(20.f);
+	ctrl.setHorizontalForceMargin(0.f);
 
 	const matrix::Vector3f zero;
-	const matrix::Vector3f pos_sp(0.f, 0.f, 1.f);
+	const matrix::Vector3f pos_sp(0.f, 0.f, 2.f);
 
 	for (int i = 0; i < 5; i++) {
 		EXPECT_NEAR(ctrl.update(zero, pos_sp, zero, zero, 0.1f)(2), 20.0f, kTol);
@@ -667,12 +773,11 @@ TEST(FoldrotorPositionVelocityControlTest, IntegratorFreezesWhileSaturatedZ)
 
 	EXPECT_NEAR(ctrl.getIntegral()(2), 0.0f, kTol);
 
-	// Reopen and probe with zero error: Fz is then integral + gravity.
-	// Frozen  -> 0    + 15.260017 = 15.260017
-	// Unfrozen would have been 10.5 + 15.260017 = 25.760017.
-	ctrl.setOutputLimits(matrix::Vector3f(-1e6f, -1e6f, -1e6f),
-			     matrix::Vector3f(1e6f, 1e6f, 1e6f));
-	EXPECT_NEAR(ctrl.update(zero, zero, zero, zero, 0.1f)(2), 15.260017f, kTol);
+	// Reopen and probe with zero error: Fz is then integral - gravity.
+	// Frozen  -> 0    - 15.260017 = -15.260017
+	// Unfrozen would have been 21 - 15.260017 = 5.739983.
+	ctrl.setForceLimits(1e6f);
+	EXPECT_NEAR(ctrl.update(zero, zero, zero, zero, 0.1f)(2), -15.260017f, kTol);
 }
 
 // FR_VEL_Z_I_LIM = 3.0 N (2026-09-09), a separate mechanism from the
@@ -701,29 +806,40 @@ TEST(FoldrotorPositionVelocityControlTest, IntegratorClampsAtFrVelZILim)
 	EXPECT_NEAR(ctrl.getIntegral()(2), 3.0f, kTol);
 }
 
-// The freeze must be directional, not a blanket hold: an error pushing
-// the output back OUT of saturation still has to integrate, otherwise
-// the integrator latches. Asymmetric limits isolate this.
+// The freeze must be directional, not a blanket hold: once the axis
+// leaves saturation, it has to integrate normally again, otherwise the
+// integrator latches. The sphere bound is symmetric (unlike the old
+// independent boxes, which could be configured asymmetrically to isolate
+// this directly), so this uses Z -- which keeps the hard conditional-
+// integration freeze (see IntegratorFreezesWhileSaturatedZ above) -- and
+// demonstrates the unfreeze with a second call whose magnitude simply
+// doesn't reach the bound, rather than an asymmetric limit.
 //
-//   step 1, pos_sp = +2: e_v = +6, Fx = 36 -> clamped to the +20 upper
-//           limit with a positive error, so frozen -> integral stays 0.
-//   step 2, pos_sp = -2: e_v = -6, Fx = -36, well inside the -1000 lower
-//           limit, so NOT saturated -> integral moves by 1*(-6)*0.1 = -0.6.
-TEST(FoldrotorPositionVelocityControlTest, IntegratorStillMovesOutOfSaturation)
+//   step 1, pos_sp_z = +2: e_v = 6, Fz = 7*6 - 0 = 42 (grav_ff = 0 here,
+//           a fresh controller, to keep the bound symmetric and exactly
+//           equal to the configured limit) -> clamped to +20 with a
+//           positive error -> frozen, integral stays 0.
+//   step 2, pos_sp_z = -0.5: e_v = 3*(-0.5) - 0 = -1.5, Fz = 7*(-1.5) +
+//           0 = -10.5, well inside +/-20 -> NOT saturated -> integral
+//           moves by 7*(-1.5)*0.1 = -1.05, and the output is the
+//           unclamped -10.5, not the previous cycle's clamped value.
+TEST(FoldrotorPositionVelocityControlTest, IntegratorUnfreezesOnceZLeavesSaturation)
 {
-	auto ctrl = makeSpecDefaultController();
-	ctrl.setOutputLimits(matrix::Vector3f(-1000.f, -1000.f, -1000.f),
-			     matrix::Vector3f(20.f, 20.f, 20.f));
+	foldrotor::PositionVelocityControl ctrl;
+	ctrl.setPositionGain(3.0f);
+	ctrl.setVelocityGains(6.0f, 1.0f, 1.0f, 7.0f, 7.0f, 0.1f);
+	ctrl.setForceLimits(20.f);
+	ctrl.setHorizontalForceMargin(0.f);
 
 	const matrix::Vector3f zero;
 
-	EXPECT_NEAR(ctrl.update(zero, matrix::Vector3f(2.f, 0.f, 0.f), zero, zero, 0.1f)(0),
+	EXPECT_NEAR(ctrl.update(zero, matrix::Vector3f(0.f, 0.f, 2.f), zero, zero, 0.1f)(2),
 		    20.0f, kTol);
-	EXPECT_NEAR(ctrl.getIntegral()(0), 0.0f, kTol);
+	EXPECT_NEAR(ctrl.getIntegral()(2), 0.0f, kTol);
 
-	EXPECT_NEAR(ctrl.update(zero, matrix::Vector3f(-2.f, 0.f, 0.f), zero, zero, 0.1f)(0),
-		    -36.0f, kTol);
-	EXPECT_NEAR(ctrl.getIntegral()(0), -0.6f, kTol);
+	EXPECT_NEAR(ctrl.update(zero, matrix::Vector3f(0.f, 0.f, -0.5f), zero, zero, 0.1f)(2),
+		    -10.5f, kTol);
+	EXPECT_NEAR(ctrl.getIntegral()(2), -1.05f, kTol);
 }
 
 // The output type composes directly with step 4b's rotation stage, which
@@ -741,33 +857,131 @@ TEST(FoldrotorPositionVelocityControlTest, OutputComposesWithInertialToBody)
 				     matrix::Vector3f(0.f, 0.f, 0.f),
 				     0.01f);
 
-	const matrix::Eulerf level(0.f, 0.f, 0.f);
+	const matrix::Quatf level(matrix::Eulerf(0.f, 0.f, 0.f));
 	const matrix::Vector3f F_b = foldrotor::inertialToBody(F_i, level);
 
+	// grav_ff SUBTRACTED, not added (sign flipped 2026-09-11, see
+	// NominalXYMatchesHandComputedCascade's comment).
 	EXPECT_NEAR(F_b(0), 33.0f, kTol);
 	EXPECT_NEAR(F_b(1), -19.5f, kTol);
-	EXPECT_NEAR(F_b(2), 15.260017f, kTol);
+	EXPECT_NEAR(F_b(2), -15.260017f, kTol);
+}
+
+// Velocity-magnitude limiting (added 2026-09-17, see PositionVelocityControl
+// .hpp's setVelocityLimits() comment and OPEN ITEM (b)). Horizontal case:
+// a big position error would otherwise demand an unbounded vel_sp before it
+// ever reaches the velocity PID.
+//   raw vel_sp = 3 * (3, 4, 0) = (9, 12, 0), norm = 15
+//   xy_max = 1.0 -> scale = 1/15 -> vel_sp_clamped = (0.6, 0.8, 0)
+//   (direction preserved: 0.8/0.6 == 12/9, not a naive per-axis clamp)
+//   e_v = vel_sp_clamped - vel = (0.6, 0.8, 0)
+//   Fx = 6 * 0.6 = 3.6
+//   Fy = 6 * 0.8 = 4.8
+//   Fz = -15.260017 (pos_sp_z = 0, grav_ff only)
+TEST(FoldrotorPositionVelocityControlTest, HorizontalVelocityLimitScalesSetpointPreservingDirection)
+{
+	auto ctrl = makeSpecDefaultController();
+	ctrl.setVelocityLimits(1.0f, 100.0f, 100.0f);
+
+	const matrix::Vector3f F = ctrl.update(matrix::Vector3f(0.f, 0.f, 0.f),
+					       matrix::Vector3f(3.f, 4.f, 0.f),
+					       matrix::Vector3f(0.f, 0.f, 0.f),
+					       matrix::Vector3f(0.f, 0.f, 0.f),
+					       0.01f);
+
+	EXPECT_NEAR(F(0), 3.6f, kTol);
+	EXPECT_NEAR(F(1), 4.8f, kTol);
+	EXPECT_NEAR(F(2), -15.260017f, kTol);
+}
+
+// Vertical case is asymmetric (up_max != down_max), unlike horizontal —
+// mirrors mc_pos_control's MPC_Z_VEL_MAX_UP/_DN convention. NED: negative
+// pos_sp_z is a climb (up), positive is a descent (down).
+//
+// Climb: raw vel_sp_z = 3 * (-10) = -30, clamped to -up_max = -1.0.
+//   e_v_z = -1.0 - 0 = -1.0
+//   Fz = 7 * (-1.0) - 15.260017 = -22.260017
+TEST(FoldrotorPositionVelocityControlTest, VerticalVelocityLimitClampsClimbAtUpMax)
+{
+	auto ctrl = makeSpecDefaultController();
+	ctrl.setVelocityLimits(100.0f, 1.0f, 0.5f);
+
+	const matrix::Vector3f F = ctrl.update(matrix::Vector3f(0.f, 0.f, 0.f),
+					       matrix::Vector3f(0.f, 0.f, -10.f),
+					       matrix::Vector3f(0.f, 0.f, 0.f),
+					       matrix::Vector3f(0.f, 0.f, 0.f),
+					       0.01f);
+
+	EXPECT_NEAR(F(2), -22.260017f, kTol);
+}
+
+// Descent: raw vel_sp_z = 3 * 10 = 30, clamped to down_max = 0.5.
+//   e_v_z = 0.5 - 0 = 0.5
+//   Fz = 7 * 0.5 - 15.260017 = -11.760017
+TEST(FoldrotorPositionVelocityControlTest, VerticalVelocityLimitClampsDescentAtDownMax)
+{
+	auto ctrl = makeSpecDefaultController();
+	ctrl.setVelocityLimits(100.0f, 1.0f, 0.5f);
+
+	const matrix::Vector3f F = ctrl.update(matrix::Vector3f(0.f, 0.f, 0.f),
+					       matrix::Vector3f(0.f, 0.f, 10.f),
+					       matrix::Vector3f(0.f, 0.f, 0.f),
+					       matrix::Vector3f(0.f, 0.f, 0.f),
+					       0.01f);
+
+	EXPECT_NEAR(F(2), -11.760017f, kTol);
+}
+
+// Default (no setVelocityLimits() call) must not clamp -- same "+/-infinity
+// is a no-op" contract as the other limit setters (setForceLimits(),
+// setIntegratorLimit()). Reuses NominalXYMatchesHandComputedCascade's exact
+// scenario/values; the point here is that no explicit setVelocityLimits()
+// call was made.
+TEST(FoldrotorPositionVelocityControlTest, DefaultVelocityLimitsDoNotClamp)
+{
+	auto ctrl = makeSpecDefaultController();
+
+	const matrix::Vector3f F = ctrl.update(matrix::Vector3f(0.f, 0.f, 0.f),
+					       matrix::Vector3f(2.f, -1.f, 0.f),
+					       matrix::Vector3f(0.5f, 0.25f, 0.f),
+					       matrix::Vector3f(0.f, 0.f, 0.f),
+					       0.01f);
+
+	EXPECT_NEAR(F(0), 33.0f, kTol);
+	EXPECT_NEAR(F(1), -19.5f, kTol);
+	EXPECT_NEAR(F(2), -15.260017f, kTol);
 }
 
 /****************************************************************************
  * Step 4c — AttitudeRateControl.
  *
- * Gains throughout are exactly controller_params.md's table:
- *   FR_ATT_P            = 3.0   (all axes)
- *   FR_RATE_RP_FF/I/D   = 3.5 / 0.1 / 0.5   (roll and pitch)
- *   FR_RATE_YAW_FF/I/D  = 2.5 / 0.0 / 0.0   (yaw)
+ * These tests verify the controller's MATH -- the P/I/D structure, the
+ * attitude->rate cascade, anti-windup and saturation -- so they drive it
+ * with a deliberately matched roll/pitch gain set:
+ *   FR_ATT_P           = 3.0             (all axes)
+ *   roll  FF/I/D       = 3.5 / 0.1 / 0.5
+ *   pitch FF/I/D       = 3.5 / 0.1 / 0.5  (equal to roll ON PURPOSE)
+ *   yaw   FF/I/D       = 2.5 / 0.0 / 0.0
  * with FR_RATE_*_FF read as the P gain on the rate error, per the
  * decision recorded in findings.md.
+ *
+ * These are NOT the shipped defaults any more. Roll and pitch were split
+ * on 2026-09-21 and pitch scaled by Iyy/Ixx (FR_RATE_P_FF = 0.17, not
+ * 3.5) -- see foldrotor_control_params.yaml. Keeping the two axes equal
+ * here is what lets the hand-computed expectations below stay symmetric
+ * and independently checkable; the shipped defaults are pinned
+ * separately by FoldrotorControlParamsTest.DefaultsMatchControllerParamsSpec.
  ****************************************************************************/
 
 namespace
 {
 
-foldrotor::AttitudeRateControl makeSpecDefaultAttitudeController()
+foldrotor::AttitudeRateControl makeMatchedGainAttitudeController()
 {
 	foldrotor::AttitudeRateControl ctrl;
 	ctrl.setAttitudeGain(3.0f);
-	ctrl.setRateGains(3.5f, 0.1f, 0.5f,   // FR_RATE_RP_FF  / _I / _D
+	ctrl.setRateGains(3.5f, 0.1f, 0.5f,   // roll  FF / I / D
+			  3.5f, 0.1f, 0.5f,   // pitch FF / I / D -- equal to roll on purpose
 			  2.5f, 0.0f, 0.0f);  // FR_RATE_YAW_FF / _I / _D
 	return ctrl;
 }
@@ -788,7 +1002,7 @@ const matrix::Vector3f kZero3;
 // the attitude P stage and the rate P stage together.
 TEST(FoldrotorAttitudeRateControlTest, NominalRollPitchMatchesHandComputedCascade)
 {
-	auto ctrl = makeSpecDefaultAttitudeController();
+	auto ctrl = makeMatchedGainAttitudeController();
 
 	const matrix::Vector3f M = ctrl.update(kLevel,
 					       matrix::Eulerf(0.2f, -0.1f, 0.f),
@@ -814,7 +1028,7 @@ TEST(FoldrotorAttitudeRateControlTest, NominalRollPitchMatchesHandComputedCascad
 // make those gains nonzero has to break a test, not pass silently.
 TEST(FoldrotorAttitudeRateControlTest, NominalYawMatchesHandComputedCascadeAndStaysProportional)
 {
-	auto ctrl = makeSpecDefaultAttitudeController();
+	auto ctrl = makeMatchedGainAttitudeController();
 
 	const matrix::Eulerf euler_sp(0.f, 0.f, 0.4f);
 	const matrix::Vector3f rate(0.f, 0.f, 0.1f);
@@ -836,7 +1050,7 @@ TEST(FoldrotorAttitudeRateControlTest, NominalYawMatchesHandComputedCascadeAndSt
 //   Mz = -0.0 * 3 =  0.0
 TEST(FoldrotorAttitudeRateControlTest, DerivativeActsOnMeasurementAtPerAxisGains)
 {
-	auto ctrl = makeSpecDefaultAttitudeController();
+	auto ctrl = makeMatchedGainAttitudeController();
 
 	const matrix::Vector3f M = ctrl.update(kLevel, kLevel, kZero3,
 					       matrix::Vector3f(1.f, 2.f, 3.f), 0.01f);
@@ -854,7 +1068,7 @@ TEST(FoldrotorAttitudeRateControlTest, DerivativeActsOnMeasurementAtPerAxisGains
 //   Mx = 3.5 * 0.6 = 2.1
 TEST(FoldrotorAttitudeRateControlTest, SetpointStepProducesNoDerivativeKick)
 {
-	auto ctrl = makeSpecDefaultAttitudeController();
+	auto ctrl = makeMatchedGainAttitudeController();
 
 	// Settled level: no error, so no integral is accumulated.
 	ctrl.update(kLevel, kLevel, kZero3, kZero3, 0.01f);
@@ -878,7 +1092,7 @@ TEST(FoldrotorAttitudeRateControlTest, SetpointStepProducesNoDerivativeKick)
 // discriminate the i_factor's presence.
 TEST(FoldrotorAttitudeRateControlTest, IntegralAccumulatesAtRollPitchGainWithIFactor)
 {
-	auto ctrl = makeSpecDefaultAttitudeController();
+	auto ctrl = makeMatchedGainAttitudeController();
 
 	const matrix::Eulerf euler_sp(0.2f, 0.f, 0.f);
 
@@ -897,7 +1111,7 @@ TEST(FoldrotorAttitudeRateControlTest, IntegralAccumulatesAtRollPitchGainWithIFa
 // pass by accident.
 TEST(FoldrotorAttitudeRateControlTest, IFactorReducesIntegrationAtLargeRateError)
 {
-	auto ctrl = makeSpecDefaultAttitudeController();
+	auto ctrl = makeMatchedGainAttitudeController();
 
 	ctrl.update(kLevel, matrix::Eulerf(2.0f, 0.f, 0.f), kZero3, kZero3, 0.1f);
 
@@ -909,7 +1123,7 @@ TEST(FoldrotorAttitudeRateControlTest, IFactorReducesIntegrationAtLargeRateError
 // entirely. att_error = 2.5 -> rate_sp = 7.5 > 6.98131700 = radians(400).
 TEST(FoldrotorAttitudeRateControlTest, IFactorFloorsAtZeroBeyondScale)
 {
-	auto ctrl = makeSpecDefaultAttitudeController();
+	auto ctrl = makeMatchedGainAttitudeController();
 
 	ctrl.update(kLevel, matrix::Eulerf(2.5f, 0.f, 0.f), kZero3, kZero3, 0.1f);
 
@@ -921,7 +1135,7 @@ TEST(FoldrotorAttitudeRateControlTest, IFactorFloorsAtZeroBeyondScale)
 // accumulation test above, which reaches 0.0059556821 per step.
 TEST(FoldrotorAttitudeRateControlTest, LandedFreezesIntegralEntirely)
 {
-	auto ctrl = makeSpecDefaultAttitudeController();
+	auto ctrl = makeMatchedGainAttitudeController();
 
 	const matrix::Eulerf euler_sp(0.2f, 0.f, 0.f);
 
@@ -941,7 +1155,7 @@ TEST(FoldrotorAttitudeRateControlTest, LandedFreezesIntegralEntirely)
 // hold there.
 TEST(FoldrotorAttitudeRateControlTest, IntegratorLimitClampsAccumulation)
 {
-	auto ctrl = makeSpecDefaultAttitudeController();
+	auto ctrl = makeMatchedGainAttitudeController();
 	ctrl.setIntegratorLimit(matrix::Vector3f(0.001f, 0.001f, 0.001f));
 
 	const matrix::Eulerf euler_sp(0.2f, 0.f, 0.f);
@@ -955,7 +1169,7 @@ TEST(FoldrotorAttitudeRateControlTest, IntegratorLimitClampsAccumulation)
 
 TEST(FoldrotorAttitudeRateControlTest, ResetIntegralClearsAccumulatedState)
 {
-	auto ctrl = makeSpecDefaultAttitudeController();
+	auto ctrl = makeMatchedGainAttitudeController();
 
 	ctrl.update(kLevel, matrix::Eulerf(0.2f, 0.1f, 0.f), kZero3, kZero3, 0.1f);
 	ASSERT_GT(fabsf(ctrl.getIntegral()(0)), 0.f);
@@ -979,7 +1193,7 @@ TEST(FoldrotorAttitudeRateControlTest, ResetIntegralClearsAccumulatedState)
 // asserted so the fact stays visible.
 TEST(FoldrotorAttitudeRateControlTest, DefaultLimitsNeitherClampNorFreeze)
 {
-	auto ctrl = makeSpecDefaultAttitudeController();
+	auto ctrl = makeMatchedGainAttitudeController();
 
 	const matrix::Eulerf euler_sp(0.2f, 0.f, 0.f);
 
@@ -999,7 +1213,7 @@ TEST(FoldrotorAttitudeRateControlTest, DefaultLimitsNeitherClampNorFreeze)
 // unbounded and reaches 0.017867046.
 TEST(FoldrotorAttitudeRateControlTest, IntegratorFreezesWhileSaturated)
 {
-	auto ctrl = makeSpecDefaultAttitudeController();
+	auto ctrl = makeMatchedGainAttitudeController();
 	ctrl.setOutputLimits(matrix::Vector3f(-1.f, -1.f, -1.f),
 			     matrix::Vector3f(1.f, 1.f, 1.f));
 
@@ -1024,7 +1238,7 @@ TEST(FoldrotorAttitudeRateControlTest, IntegratorFreezesWhileSaturated)
 //           i_factor * 0.1 * (-0.6) * 0.1 = -0.0059556821.
 TEST(FoldrotorAttitudeRateControlTest, IntegratorStillMovesOutOfSaturation)
 {
-	auto ctrl = makeSpecDefaultAttitudeController();
+	auto ctrl = makeMatchedGainAttitudeController();
 	ctrl.setOutputLimits(matrix::Vector3f(-1000.f, -1000.f, -1000.f),
 			     matrix::Vector3f(1.f, 1.f, 1.f));
 
@@ -1047,7 +1261,7 @@ TEST(FoldrotorAttitudeRateControlTest, IntegratorStillMovesOutOfSaturation)
 // The sign difference alone makes this test unambiguous.
 TEST(FoldrotorAttitudeRateControlTest, YawErrorWrapsAcrossPi)
 {
-	auto ctrl = makeSpecDefaultAttitudeController();
+	auto ctrl = makeMatchedGainAttitudeController();
 
 	const matrix::Vector3f M = ctrl.update(matrix::Eulerf(0.f, 0.f, 3.0f),
 					       matrix::Eulerf(0.f, 0.f, -3.0f),
@@ -1063,7 +1277,7 @@ TEST(FoldrotorAttitudeRateControlTest, YawErrorWrapsAcrossPi)
 // Mx = 3.5 * 0.84955592 = 2.97344572, positive rather than -63.0.
 TEST(FoldrotorAttitudeRateControlTest, RollErrorWrapsAcrossPiToo)
 {
-	auto ctrl = makeSpecDefaultAttitudeController();
+	auto ctrl = makeMatchedGainAttitudeController();
 
 	const matrix::Vector3f M = ctrl.update(matrix::Eulerf(3.0f, 0.f, 0.f),
 					       matrix::Eulerf(-3.0f, 0.f, 0.f),
@@ -1081,7 +1295,7 @@ TEST(FoldrotorAttitudeRateControlTest, RollErrorWrapsAcrossPiToo)
 // OutputComposesWithInertialToBody plays for the force path.
 TEST(FoldrotorAttitudeRateControlTest, OutputIsPerAxisBodyMomentInAllocationOrder)
 {
-	auto ctrl = makeSpecDefaultAttitudeController();
+	auto ctrl = makeMatchedGainAttitudeController();
 
 	const matrix::Vector3f M_roll = ctrl.update(kLevel, matrix::Eulerf(0.1f, 0.f, 0.f),
 					kZero3, kZero3, 0.1f);
@@ -1113,7 +1327,10 @@ TEST(FoldrotorCascadeRateGateTest, FirstCallAlwaysFires)
 	foldrotor::CascadeRateGate gate(20000); // 50 Hz
 	float dt = -1.f;
 	EXPECT_TRUE(gate.due(1000000, &dt));
-	EXPECT_NEAR(dt, 0.f, 1e-9f);
+	// dt CONTRACT revised 2026-09-11 (CascadeRateGate.hpp): the first fire
+	// reports the nominal period, not 0 -- a zero dt was reaching the PID
+	// D terms as a division by zero. period_us = 20000 -> 0.02 s.
+	EXPECT_NEAR(dt, 0.02f, 1e-9f);
 }
 
 // Driven at 1000 Hz (1000 us/tick) with a 50 Hz gate (period 20000 us):
@@ -1182,7 +1399,7 @@ TEST(FoldrotorCascadeRateGateTest, NotDueBeforePeriodElapses)
 // and the rate stage at 1000 Hz depends on.
 TEST(FoldrotorAttitudeRateControlSplitTest, RateSetpointHoldsAcrossUpdateRateCallsWithoutAttitudeUpdate)
 {
-	auto ctrl = makeSpecDefaultAttitudeController();
+	auto ctrl = makeMatchedGainAttitudeController();
 
 	const matrix::Vector3f rate_sp = ctrl.updateAttitude(kLevel, matrix::Eulerf(0.2f, -0.1f, 0.f));
 	EXPECT_NEAR(rate_sp(0), 0.6f, 1e-5f);
@@ -1204,7 +1421,7 @@ TEST(FoldrotorAttitudeRateControlSplitTest, RateSetpointHoldsAcrossUpdateRateCal
 // than one inline body -- the split changed structure, not behaviour.
 TEST(FoldrotorAttitudeRateControlSplitTest, UpdateStillMatchesPreSplitHandComputedCascade)
 {
-	auto ctrl = makeSpecDefaultAttitudeController();
+	auto ctrl = makeMatchedGainAttitudeController();
 
 	const matrix::Vector3f M = ctrl.update(kLevel,
 					       matrix::Eulerf(0.2f, -0.1f, 0.f),
@@ -1221,8 +1438,8 @@ TEST(FoldrotorAttitudeRateControlSplitTest, UpdateStillMatchesPreSplitHandComput
 // entry points are the same math, just split into two calls.
 TEST(FoldrotorAttitudeRateControlSplitTest, SplitCallsMatchCombinedUpdate)
 {
-	auto ctrl_split = makeSpecDefaultAttitudeController();
-	auto ctrl_combined = makeSpecDefaultAttitudeController();
+	auto ctrl_split = makeMatchedGainAttitudeController();
+	auto ctrl_combined = makeMatchedGainAttitudeController();
 
 	const matrix::Eulerf euler_sp(0.2f, -0.1f, 0.05f);
 	const matrix::Vector3f rate(0.05f, 0.02f, -0.01f);
@@ -1248,19 +1465,20 @@ TEST(FoldrotorAttitudeRateControlSplitTest, SplitCallsMatchCombinedUpdate)
 // computed by hand from M0's definition (allocation.md "The matrices")
 // with a standalone numpy check, not read back off this implementation.
 
-// allocation.md's Minv literal, recomputed 2026-09-09 for the
-// SDF-verified geometry (s1y/s2y = +-0.2684 m, s1z/s2z = +0.0301 m --
-// see FoldrotorAllocation.hpp OPEN ITEM (b), was +-0.15 m / +0.02 m).
-// Standalone numpy inverse of the corrected M0, same as the original
-// literal's provenance; allocation.md's "The matrices" section carries
-// the same value, marked as superseding the old one.
+// allocation.md's Minv literal, recomputed 2026-09-21 for the
+// sign-corrected, CoM-referenced geometry (s1y = -0.267356, s2y =
+// +0.269404, s1z/s2z = -0.054924/-0.054926 m, k = -0.022274 -- see
+// FoldrotorAllocation.hpp OPEN ITEM (d), was +-0.2684 m / +0.0301 m /
+// +0.017). Standalone numpy inverse of the corrected M0, same as the
+// original literal's provenance; allocation.md's "The matrices" section
+// carries the same value, marked as superseding the old one.
 static const float kSpecMinv[6][6] = {
-	{ +0.5000000000f, +0.0035373791f,  0.0000000000f, +0.1175209007f,  0.0000000000f, -1.8554476330f },
-	{ -0.8852941176f, +0.5000000000f,  0.0000000000f,  0.0000000000f, +29.4117647059f,  0.0000000000f },
-	{  0.0000000000f, +0.0558489738f, +0.5000000000f, +1.8554476330f,  0.0000000000f, +0.1175209007f },
-	{ +0.5000000000f, -0.0035373791f,  0.0000000000f, -0.1175209007f,  0.0000000000f, +1.8554476330f },
-	{ +0.8852941176f, +0.5000000000f,  0.0000000000f,  0.0000000000f, -29.4117647059f,  0.0000000000f },
-	{  0.0000000000f, -0.0558489738f, +0.5000000000f, -1.8554476330f,  0.0000000000f, -0.1175209007f },
+	{ +0.5014746190f, -0.0026120310f, +0.0001223900f, -0.1535630527f, +0.0000034470f, +1.8502851798f },
+	{ +0.3818241330f, +0.4999999410f, +0.0000000030f, -0.0000034470f, -22.4476968660f, +0.0000415350f },
+	{ -0.0001230960f, -0.0314724260f, +0.5014746770f, -1.8502851798f, +0.0000415350f, -0.1535630527f },
+	{ +0.4985253810f, +0.0026120310f, -0.0001223900f, +0.1535630527f, -0.0000034470f, -1.8502851798f },
+	{ -0.3818241330f, +0.5000000590f, -0.0000000030f, +0.0000034470f, +22.4476968660f, -0.0000415350f },
+	{ +0.0001230960f, +0.0314724260f, +0.4985253230f, +1.8502851798f, -0.0000415350f, +0.1535630527f },
 };
 
 TEST(FoldrotorAllocationTest, MinvTimesM0IsIdentity)
@@ -1306,56 +1524,689 @@ TEST(FoldrotorAllocationTest, DerivedInverseMatchesSpecLiteral)
 	}
 }
 
-// Hover, Fz = +15.26 N (Z-up positive per allocation.md's thrust vector
-// -- see FoldrotorAllocation.hpp OPEN ITEM (c), NOT PX4 body FRD). Hand
-// solved: with Fx=Fy=Mx=My=Mz=0, M0's structure splits Fz evenly and
-// both moment-arm terms vanish, so F1=F2=Fz/2=7.63 N, alpha=beta=0 on
-// both rotors, unsaturated.
-TEST(FoldrotorAllocationTest, HoverProducesEvenSplitZeroTilt)
+// ---------------------------------------------------------------------
+// allocation.md's long-planned "Geometry-vs-SDF test", finally written
+// 2026-09-21 (FoldrotorAllocation.hpp OPEN ITEM (d)). It was deliberately
+// left unwritten while the geometry mismatch was a carried deferral,
+// since it would have been red on arrival by design; it is written now
+// because the constants it pins were just corrected.
+//
+// Provenance of the expected values: a forward-kinematics walk of
+// Tools/simulation/gz/models/foldrotor3/model.sdf -- resolve each
+// PropNLink's pose through its joint chain at zero fold/tilt, take the
+// mass-weighted CoM of every link, and subtract. Done by
+// sitl_testing/allocation_study/sdf_fk.py, whose output is cross-checked
+// against the independent bench force/torque measurements recorded in
+// force_moment_test.md (all ten cases, signs included). These are body
+// FLU, the frame allocate() is fed.
+//
+// This is the test that would have caught the 2026-09-21 sign inversion:
+// the pre-fix constants had rotor 1 on +Y at z=+0.0301 (relative to the
+// base_link origin), where the SDF puts it on -Y at z=-0.0549 (relative
+// to the true CoM).
+TEST(FoldrotorAllocationTest, GeometryConstantsMatchSdfForwardKinematics)
 {
 	foldrotor::FoldrotorAllocation alloc;
-	const auto out = alloc.allocate(matrix::Vector3f(0.f, 0.f, 15.26f), matrix::Vector3f(0.f, 0.f, 0.f));
+	const matrix::SquareMatrix<float, 6> &M0 = alloc.getM0();
 
-	EXPECT_NEAR(out.F1, 7.63f, 1e-4f);
-	EXPECT_NEAR(out.F2, 7.63f, 1e-4f);
+	// Rotor positions relative to the true CoM, body FLU, from the SDF.
+	// 2026-09-22: re-derived after the ballast mast moved the CoM from
+	// z=+0.0248 to z=-0.0471. s1z/s2z CHANGED SIGN -- the rotors now sit
+	// ABOVE the CoM. Independently reproduced by sdf_fk.py.
+	const float s1y = -0.267583f, s1z = +0.017010f;
+	const float s2y = 0.269177f,  s2z = +0.017009f;
+	// Drag/thrust ratio: model.sdf's momentConstant (0.022274), signed
+	// negative because rotor 1 (Prop1) is the ccw rotor and so reacts
+	// along -T. Bench cross-check: motor 1 alone gave Mz = +0.2240 N*m
+	// in FRD against 10.066 N of thrust -> 0.02225, same sign.
+	const float k = -0.022274f;
+
+	// M0's moment rows must equal r x T + drag, built here with explicit
+	// cross products rather than by re-transcribing the same rows the
+	// implementation uses -- otherwise this test could only ever confirm
+	// that a transcription matches itself.
+	const matrix::Vector3f r1(0.f, s1y, s1z);
+	const matrix::Vector3f r2(0.f, s2y, s2z);
+
+	for (int axis = 0; axis < 3; axis++) {
+		matrix::Vector3f e1{}, e2{};
+		e1(axis) = 1.f;
+		e2(axis) = 1.f;
+
+		// Column `axis` is rotor 1's response to a unit thrust along
+		// that body axis; column `axis + 3` is rotor 2's.
+		const matrix::Vector3f m1 = r1.cross(e1) + e1 * k;
+		const matrix::Vector3f m2 = r2.cross(e2) - e2 * k;
+
+		for (int row = 0; row < 3; row++) {
+			EXPECT_NEAR(M0(3 + row, axis), m1(row), 1e-6f) << "rotor 1, moment row " << row << ", axis " << axis;
+			EXPECT_NEAR(M0(3 + row, 3 + axis), m2(row), 1e-6f) << "rotor 2, moment row " << row << ", axis " << axis;
+		}
+	}
+}
+
+// Force/moment DIRECTION test -- the tier allocation.md names between
+// open-loop actuator tests and closed-loop validation, and the check
+// that the 2026-09-21 inversion (OPEN ITEM (d)) slipped past for weeks
+// because every other allocation test compared the allocator against
+// its own M0.
+//
+// Demand a small moment on one axis at hover, run the real allocator,
+// then evaluate what the resulting rotor commands PHYSICALLY produce --
+// using SDF geometry and explicit cross products, never M0. A sign
+// error anywhere in the constants, the row transcription, or the
+// atan2 inversion shows up here as a negative ratio, which in closed
+// loop is positive feedback.
+//
+// Demands are kept small (<= 0.05 N*m) so nothing clamps; the
+// clamp-without-redistribution path is covered by the tilt/thrust
+// saturation tests above.
+TEST(FoldrotorAllocationTest, CommandedMomentProducesSameSignPhysicalMoment)
+{
+	foldrotor::FoldrotorAllocation alloc;
+
+	// Same SDF-derived geometry as the test above.
+	const matrix::Vector3f r1(0.f, -0.267356f, -0.054924f);
+	const matrix::Vector3f r2(0.f, 0.269404f, -0.054926f);
+	const float k_drag = 0.022274f;
+	const float hover_fz = 15.260017f;
+
+	// Physical moment of one allocator output, about the true CoM.
+	auto physical_moment = [&](const foldrotor::FoldrotorAllocation::Output & o) {
+		auto thrust = [](float F, float alpha, float beta) {
+			return matrix::Vector3f(F * sinf(beta),
+						-F * cosf(beta) * sinf(alpha),
+						F * cosf(beta) * cosf(alpha));
+		};
+		const matrix::Vector3f T1 = thrust(o.F1, o.alpha1, o.beta1);
+		const matrix::Vector3f T2 = thrust(o.F2, o.alpha2, o.beta2);
+		// Rotor 1 is ccw and reacts along -T; rotor 2 is cw, +T.
+		return r1.cross(T1) - T1 * k_drag + r2.cross(T2) + T2 * k_drag;
+	};
+
+	const matrix::Vector3f F_hover(0.f, 0.f, hover_fz);
+	const matrix::Vector3f trim = physical_moment(alloc.allocate(F_hover, matrix::Vector3f{}));
+
+	for (int axis = 0; axis < 3; axis++) {
+		for (float magnitude : {0.05f, -0.05f}) {
+			matrix::Vector3f M_cmd{};
+			M_cmd(axis) = magnitude;
+
+			const auto out = alloc.allocate(F_hover, M_cmd);
+			ASSERT_FALSE(out.saturated) << "axis " << axis << " magnitude " << magnitude;
+
+			const matrix::Vector3f delivered = physical_moment(out) - trim;
+			const float ratio = delivered(axis) / magnitude;
+
+			EXPECT_GT(ratio, 0.f) << "axis " << axis << " magnitude " << magnitude
+					      << ": allocator produced the OPPOSITE moment (ratio " << ratio << ")";
+			EXPECT_NEAR(ratio, 1.f, 0.05f) << "axis " << axis << " magnitude " << magnitude;
+		}
+	}
+}
+
+// The rate loop's output limits must not exceed what the allocator can
+// actually deliver while holding a hover, or AttitudeRateControl's
+// conditional-integration anti-windup goes blind in the gap: it believes
+// itself unsaturated while the allocator is already clamping channels to
+// their rails, which is the bang-bang chatter traced through the
+// free-flight crashes (findings.md, 2026-09-18 and 2026-09-21).
+//
+// Rather than hardcoding the authority figures, this measures them the
+// same way the study did: bisect the largest single-axis moment demand
+// the allocator satisfies without setting `saturated`, holding the
+// vehicle's weight on Fz and everything else at zero. That way the test
+// re-derives the ceiling from whatever geometry the allocator currently
+// carries, so a future geometry change moves the measured bound rather
+// than silently invalidating a stale literal.
+TEST(FoldrotorAllocationTest, RateLimitsDoNotExceedHoverMomentAuthority)
+{
+	foldrotor::FoldrotorAllocation alloc;
+	const matrix::Vector3f F_hover(0.f, 0.f, 15.260017f);
+
+	auto hover_authority = [&](int axis) {
+		float lo = 0.f, hi = 20.f;
+
+		for (int i = 0; i < 60; i++) {
+			const float mid = 0.5f * (lo + hi);
+			matrix::Vector3f M_cmd{};
+			M_cmd(axis) = mid;
+
+			if (alloc.allocate(F_hover, M_cmd).saturated) {
+				hi = mid;
+
+			} else {
+				lo = mid;
+			}
+		}
+
+		return lo;
+	};
+
+	// Body FRD roll/pitch/yaw map onto allocator FLU axes 0/1/2; the
+	// frame flip negates the value, not the reachable magnitude.
+	EXPECT_LE(FoldrotorControl::kRateMxLimit, hover_authority(0)) << "roll limit exceeds hover authority";
+	EXPECT_LE(FoldrotorControl::kRateMyLimit, hover_authority(1)) << "pitch limit exceeds hover authority";
+	EXPECT_LE(FoldrotorControl::kRateMzLimit, hover_authority(2)) << "yaw limit exceeds hover authority";
+
+	// Sanity: the bound is a real measurement, not a degenerate zero that
+	// would make the assertions above vacuous.
+	EXPECT_GT(hover_authority(0), 1.f);
+	EXPECT_GT(hover_authority(1), 0.1f);
+	EXPECT_GT(hover_authority(2), 1.f);
+}
+
+// The test above pins authority at hover thrust ONLY, which is why it
+// kept passing while the vehicle flipped: the vehicle never operates at
+// hover Fz during a takeoff. The position loop commands
+// Fz = FR_VEL_Z_GRAV_FF + FR_VEL_Z_FF * FR_VEL_Z_MAX_UP from the instant
+// of arming, and roll authority falls as the collective eats the
+// per-rotor budget the differential needs.
+//
+// This is the regression guard for FoldrotorControl::rollAuthorityAtThrust()
+// (findings.md 2026-09-21 (3)): the scheduled limit must never promise
+// more roll than the real allocator can deliver, at ANY collective
+// thrust in the operating range -- not just at hover.
+TEST(FoldrotorAllocationTest, ScheduledMomentEnvelopeIsDeliverable)
+{
+	foldrotor::FoldrotorAllocation alloc;
+
+	// The allocator is fed body FLU (OPEN ITEM (c)), where hover Fz is
+	// POSITIVE. Ask for the scheduled envelope on all three axes at once,
+	// together with the horizontal force the position loop is still
+	// allowed to command -- i.e. exactly the worst wrench the cascade can
+	// legally produce at this collective -- and require that the allocator
+	// can deliver it without clamping anything.
+	//
+	// Sweeping the horizontal direction matters: the envelope is not
+	// isotropic in the XY plane (roll and yaw both couple to the rotor
+	// y-offsets), so a direction-blind check would pass on the easy
+	// bearings and miss the binding one.
+	bool saw_reduction = false;
+
+	for (float fz = 4.f; fz <= 29.f; fz += 0.25f) {
+		const matrix::Vector3f env = FoldrotorControl::momentEnvelopeAtThrust(fz);
+
+		for (int k = 0; k < 16; k++) {
+			const float theta = float(k) * (2.f * M_PI_F / 16.f);
+			const matrix::Vector3f F(FoldrotorControl::kPosVelForceXYLimit * cosf(theta),
+						 FoldrotorControl::kPosVelForceXYLimit * sinf(theta),
+						 fz);
+
+			EXPECT_FALSE(alloc.allocate(F, env).saturated)
+					<< "scheduled envelope (" << env(0) << ", " << env(1) << ", " << env(2)
+					<< ") N*m is not deliverable at Fz = " << fz
+					<< " N, bearing " << math::degrees(theta) << " deg";
+		}
+
+		if (env(0) < FoldrotorControl::kRateMxLimit - 1e-3f) {
+			saw_reduction = true;
+		}
+	}
+
+	// The schedule must actually bite -- a function returning the peak
+	// constants everywhere would satisfy the loop above only if the
+	// allocator never ran out of authority, which is precisely the
+	// assumption this test exists to disprove.
+	EXPECT_TRUE(saw_reduction) << "schedule never reduced the limit; it is not doing anything";
+
+	// Sign-independence: Fz is DOWN-positive in PX4 body FRD, so the
+	// hovering vehicle presents a negative value to this function.
+	EXPECT_EQ(FoldrotorControl::momentEnvelopeAtThrust(-21.72f),
+		  FoldrotorControl::momentEnvelopeAtThrust(21.72f));
+
+	// The envelope collapses at BOTH ends, which is the property a single
+	// constant could not express and the roll-only schedule got wrong: at
+	// 30 N both rotors are pinned at kMaxThrust with nothing left to
+	// differentiate, and at 0 N there is no thrust to vector at all.
+	for (int a = 0; a < 3; a++) {
+		EXPECT_NEAR(FoldrotorControl::momentEnvelopeAtThrust(0.f)(a), 0.f, 1e-6f);
+		EXPECT_NEAR(FoldrotorControl::momentEnvelopeAtThrust(30.f)(a), 0.f, 1e-6f);
+		EXPECT_GT(FoldrotorControl::momentEnvelopeAtThrust(21.72f)(a),
+			  FoldrotorControl::momentEnvelopeAtThrust(28.f)(a))
+				<< "axis " << a << ": authority must fall as the collective eats the budget";
+	}
+
+	// The FR_VEL_Z_MAX_UP = 0.3 operating point must leave materially more
+	// roll than the old 1.0 m/s one -- this is the justification for
+	// lowering that param, and it survives the move from the roll-only
+	// schedule to the full envelope.
+	//
+	// Both operating points moved 2026-09-22: they are hover + the climb
+	// thrust, and the ballast mast took hover from 15.26 N to 19.615 N.
+	// 17.36 -> 21.72 and 22.26 -> 26.62, same +2.1 N / +7.0 N offsets.
+	EXPECT_GT(FoldrotorControl::momentEnvelopeAtThrust(21.72f)(0),
+		  FoldrotorControl::momentEnvelopeAtThrust(26.62f)(0) + 0.3f);
+}
+
+// Regression guard for the horizontal-force cap (kPosVelForceXYLimit,
+// findings.md 2026-09-21 (5)). The sphere saturation alone permitted
+// ~22 N of horizontal force at hover thrust; the allocator cannot deliver
+// anything like that, because horizontal force comes from tilting alpha/
+// beta and both are railed at +-kMaxTilt. This pins the actual ceiling so
+// a future re-tune of the sphere cannot silently reopen the gap.
+TEST(FoldrotorAllocationTest, HorizontalForceCapIsWithinTiltAuthority)
+{
+	foldrotor::FoldrotorAllocation alloc;
+
+	// With NO moment reserved the allocator can manage a few newtons
+	// sideways; the cap must sit below that, since the rate loop needs
+	// the remaining tilt range for moments.
+	float lo = 0.f, hi = 30.f;
+
+	for (int i = 0; i < 60; i++) {
+		const float mid = 0.5f * (lo + hi);
+		bool ok = true;
+
+		for (int k = 0; k < 16; k++) {
+			const float theta = float(k) * (2.f * M_PI_F / 16.f);
+
+			if (alloc.allocate(matrix::Vector3f(mid * cosf(theta), mid * sinf(theta), 17.36f),
+					   matrix::Vector3f()).saturated) {
+				ok = false;
+				break;
+			}
+		}
+
+		if (ok) { lo = mid; } else { hi = mid; }
+	}
+
+	EXPECT_LT(FoldrotorControl::kPosVelForceXYLimit, lo)
+			<< "horizontal cap " << FoldrotorControl::kPosVelForceXYLimit
+			<< " N exceeds the " << lo << " N the allocator can deliver with ZERO moment reserved";
+
+	// And the sphere's own horizontal allowance at this thrust -- which is
+	// what bounded the loop before this fix -- must be far above it, or
+	// the cap is not the binding constraint and this fix does nothing.
+	const float sphere_xy = sqrtf(28.f * 28.f - 17.36f * 17.36f);
+	EXPECT_GT(sphere_xy, 4.f * FoldrotorControl::kPosVelForceXYLimit);
+}
+
+// Every loop's integrator clamp must sit BELOW the authority that loop
+// actually has. This is the invariant that was violated for the whole
+// 2026-09-1x/2026-09-21 flip investigation and never showed up as a test
+// failure: FR_RATE_R_I_LIM was 3.8 N*m against a true roll authority of
+// 1.47, and FR_VEL_XY_I_LIM was 15 N against a 1 N horizontal cap -- so
+// each integrator could, on its own, wind up to many times the total the
+// vehicle could ever deliver, and stay there. Anti-windup cannot save a
+// loop whose clamp is above the rail.
+//
+// The margins here are deliberately loose (the point is the ORDERING, not
+// a tuning value) but the assertions are strict inequalities, so a future
+// re-tune that reintroduces the inversion fails immediately.
+TEST(FoldrotorControlParamTest, IntegratorLimitsStayBelowTheirAuthority)
+{
+	const matrix::Vector3f hover_env = FoldrotorControl::momentEnvelopeAtThrust(19.615f);
+
+	auto default_of = [](const char *name) {
+		param_t h = param_find(name);
+		EXPECT_NE(h, PARAM_INVALID) << name;
+		float v = NAN;
+		param_get(h, &v);
+		return v;
+	};
+
+	EXPECT_LT(default_of("FR_RATE_R_I_LIM"), hover_env(0))
+			<< "roll rate integrator can wind past the deliverable roll moment";
+	EXPECT_LT(default_of("FR_RATE_P_I_LIM"), hover_env(1))
+			<< "pitch rate integrator can wind past the deliverable pitch moment";
+
+	// The horizontal velocity integrator is bounded by the hard XY force
+	// cap, not by a moment.
+	EXPECT_LT(default_of("FR_VEL_XY_I_LIM"), FoldrotorControl::kPosVelForceXYLimit)
+			<< "horizontal velocity integrator can wind past the horizontal force cap";
+
+	// Vertical is the one axis with real headroom: the integrator trims
+	// around FR_VEL_Z_GRAV_FF, so its clamp is compared against the slack
+	// between hover weight and the combined force ceiling, not against
+	// zero.
+	EXPECT_LT(default_of("FR_VEL_Z_I_LIM"), 28.f - default_of("FR_VEL_Z_GRAV_FF"))
+			<< "vertical velocity integrator can wind past the combined force ceiling";
+}
+
+// The rate loop must stay LINEAR across the whole range of rate setpoints
+// the attitude loop above it can produce. If FF * (achievable rate error)
+// exceeds the moment envelope, the loop is a relay, not a controller --
+// which is exactly what made the vehicle bang-bang on roll within 44 ms of
+// arming (findings.md 2026-09-21 (6)): FR_RATE_R_FF = 3.5 against a 1.47
+// N*m envelope railed at a rate error of only 0.42 rad/s, i.e. at ~8 deg
+// of attitude error.
+TEST(FoldrotorControlParamTest, RateLoopStaysLinearOverAttitudeLoopDemand)
+{
+	auto default_of = [](const char *name) {
+		param_t h = param_find(name);
+		EXPECT_NE(h, PARAM_INVALID) << name;
+		float v = NAN;
+		param_get(h, &v);
+		return v;
+	};
+
+	const matrix::Vector3f hover_env = FoldrotorControl::momentEnvelopeAtThrust(19.615f);
+	const float att_p = default_of("FR_ATT_P");
+
+	// Largest rate setpoint the attitude stage can ask for at the tilt we
+	// still expect to recover from. 45 deg is the design target: beyond
+	// that this airframe cannot hold itself up regardless of moment.
+	const float max_tilt_error = M_PI_F / 4.f;
+	const float max_rate_sp = att_p * max_tilt_error;
+
+	const char *ff_name[3] = {"FR_RATE_R_FF", "FR_RATE_P_FF", "FR_RATE_YAW_FF"};
+
+	for (int a = 0; a < 2; a++) {   // roll, pitch -- yaw_sp is not produced this way
+		const float rail_at = hover_env(a) / default_of(ff_name[a]);
+		EXPECT_GT(rail_at, max_rate_sp)
+				<< ff_name[a] << " rails the rate loop at " << rail_at
+				<< " rad/s, below the " << max_rate_sp
+				<< " rad/s the attitude loop commands at 45 deg of error";
+	}
+}
+
+// fitWrenchToEnvelope() must leave the allocator with something it can
+// satisfy exactly, for ANY commanded wrench -- including the physically
+// impossible ones the cascade produces when the vehicle is far from level
+// (at 73 deg of pitch, holding altitude asks for ~17 N of body-FORWARD
+// force, which no amount of +-45 deg rotor tilt can deliver).
+//
+// This is the guard for the clamp-not-redistribute hazard that drove the
+// whole flip investigation: an infeasible request came back as an
+// arbitrary delivered wrench, worst case with My sign-flipped. The fit
+// removes the hazard by construction rather than by tuning.
+TEST(FoldrotorAllocationTest, FittedWrenchNeverSaturates)
+{
+	FoldrotorControl ctrl;
+
+	// Sweep well beyond the envelope on every axis, including the tilted-
+	// vehicle case where most of the collective has rotated into body X.
+	const float fxy[] = { 0.f, 1.f, 5.f, 17.f, 40.f};
+	const float fz[]  = { 0.f, 5.f, 15.26f, 20.f, 35.f, -10.f};
+	const float mom[] = { 0.f, 0.15f, 1.5f, 5.f, 20.f};
+
+	int fitted = 0;
+
+	for (float h : fxy) {
+		for (float v : fz) {
+			for (float m : mom) {
+				for (int k = 0; k < 8; k++) {
+					const float theta = float(k) * (2.f * M_PI_F / 8.f);
+					matrix::Vector3f F(h * cosf(theta), h * sinf(theta), v);
+					matrix::Vector3f M(m, m * 0.1f, m);
+
+					const bool was_saturated = ctrl.getAllocation().allocate(F, M).saturated;
+					ctrl.fitWrenchToEnvelope(F, M);
+
+					EXPECT_FALSE(ctrl.getAllocation().allocate(F, M).saturated)
+							<< "fit left an infeasible wrench at |Fxy|=" << h
+							<< " Fz=" << v << " M=" << m << " bearing " << k;
+
+					if (was_saturated) { fitted++; }
+				}
+			}
+		}
+	}
+
+	// Non-degeneracy: the sweep must actually contain infeasible cases, or
+	// the assertion above is vacuous.
+	EXPECT_GT(fitted, 50) << "sweep never produced an infeasible wrench";
+}
+
+// The fit's PRIORITY ordering, which is the part that matters for flight:
+// vertical force is held, then moment, then horizontal force. Getting this
+// backwards would trade away the ability to stay upright in order to chase
+// a horizontal position setpoint.
+TEST(FoldrotorAllocationTest, FitSacrificesHorizontalForceBeforeMoment)
+{
+	FoldrotorControl ctrl;
+
+	// A wrench that is feasible in Fz and moment alone, but not once a
+	// large horizontal force is added.
+	matrix::Vector3f F(12.f, 0.f, 15.26f);
+	matrix::Vector3f M(1.2f, 0.1f, 1.2f);
+	const matrix::Vector3f M_commanded = M;
+
+	ASSERT_TRUE(ctrl.getAllocation().allocate(F, M).saturated) << "test case is not infeasible";
+	ctrl.fitWrenchToEnvelope(F, M);
+
+	// Vertical force untouched ...
+	EXPECT_FLOAT_EQ(F(2), 15.26f);
+	// ... moment untouched ...
+	EXPECT_FLOAT_EQ(M(0), M_commanded(0));
+	EXPECT_FLOAT_EQ(M(1), M_commanded(1));
+	EXPECT_FLOAT_EQ(M(2), M_commanded(2));
+	// ... and the horizontal force is what gave way.
+	EXPECT_LT(F(0), 12.f);
+	EXPECT_GE(F(0), 0.f);
+}
+
+// --- Pitch tilt lever (2026-09-21 architecture change) ---------------
+//
+// Verification criteria from allocation.md "Pitch actuation path" and
+// controller.md "Attitude/rate-loop form" item 5.
+
+// THE defining property. Routing pitch through the body-x lever must
+// drive the DIFFERENTIAL FOLD command to zero, because fold is the heavy,
+// slow joint (0.0136 kg*m^2, 6.1 Hz, zeta 0.48) and tilt is the light,
+// fast, well-damped one (0.0012 kg*m^2, 20.5 Hz, zeta 1.61). If this
+// assertion fails the change is cosmetic: the moment is still being made
+// on the actuator that cannot close a 2.77 Hz unstable pole.
+TEST(FoldrotorAllocationTest, PitchLeverMovesPitchFromFoldToTilt)
+{
+	FoldrotorControl ctrl;
+	const float lever = foldrotor::FoldrotorAllocation::pitchLeverFrd();
+	const float My = 0.10f;   // FLU
+
+	// Lever OFF: pitch is made by differential fold, and it is expensive.
+	const auto off = ctrl.getAllocation().allocate(
+				 matrix::Vector3f(0.f, 0.f, 19.615f), matrix::Vector3f(0.f, My, 0.f));
+	const float fold_off = 0.5f * (fabsf(off.alpha1) + fabsf(off.alpha2));
+	EXPECT_NEAR(math::degrees(fold_off), 12.86f, 0.5f) << "drag-path fold cost changed";
+	EXPECT_LT(fabsf(off.beta1), math::radians(0.5f)) << "lever off must not use tilt";
+
+	// Lever ON: same commanded My, Fx supplies it through the 0.0549
+	// N*m/N arm.
+	//
+	// SIGN. allocate() is FLU (allocation.md "Frame convention"), and
+	// pitchLeverFrd() is FRD, so the conversion is NOT a no-op even though
+	// x itself is common to both frames: My flips between the frames, so
+	//   My_flu = kS1z * Fx  ->  Fx = -My_flu / pitchLeverFrd().
+	// Run() does the equivalent in FRD (+My_frd / pitchLeverFrd()) where
+	// no flip is needed. Writing it out because getting it backwards
+	// DOUBLES the fold command instead of cancelling it -- which is what
+	// the first version of this test did, and the allocator reported 30
+	// deg of fold rather than 0.
+	const float fx_flu = -My / lever;
+	const auto on = ctrl.getAllocation().allocate(
+				matrix::Vector3f(fx_flu, 0.f, 19.615f), matrix::Vector3f(0.f, My, 0.f));
+
+	EXPECT_LT(math::degrees(fabsf(on.alpha1)), 0.5f) << "fold should fall out entirely";
+	EXPECT_LT(math::degrees(fabsf(on.alpha2)), 0.5f) << "fold should fall out entirely";
+	EXPECT_NEAR(math::degrees(fabsf(on.beta1)), 16.70f, 0.5f) << "tilt should carry it instead";
+
+	// REVERSED 2026-09-22, and this is the point. Before the ballast mast
+	// the lever arm was 0.0549 N*m/N and moving pitch onto tilt was
+	// CHEAPER in travel (6.8 deg vs 16.3). The mast shortened the arm to
+	// 0.0170, so the same moment now costs MORE tilt than it did fold
+	// (16.7 vs 12.9 deg) and 5.9 N of body-x force on top. The lever is
+	// now a worse deal on every axis, which is why FR_PITCH_LEVER
+	// defaults to 0. Asserting the inequality in its true direction
+	// rather than deleting it keeps that trade visible.
+	EXPECT_GT(fabsf(on.beta1), fold_off)
+			<< "lever is expected to cost MORE travel at the mast geometry";
+}
+
+// The lever no longer buys authority at the ballast-mast geometry, and
+// that is worth pinning rather than quietly dropping.
+//
+// Before the mast the arm was 0.0549 N*m/N, so letting Fx move raised
+// max|My| from 0.342 to 1.490 N*m. The mast shortened the arm to 0.0170,
+// and the arithmetic collapses: reaching even the Fx-pinned ceiling
+// (0.440 N*m at the new 19.615 N hover) would demand 25.9 N of body-x
+// force, far outside the actuator box. So the lever can only RELOCATE
+// pitch travel now, never extend the envelope.
+//
+// This is the measured justification for FR_PITCH_LEVER defaulting to 0.
+// The mechanism is kept because it is correct for any geometry with the
+// rotors far from the CoM -- it is this particular airframe, after the
+// mast, that no longer benefits.
+TEST(FoldrotorAllocationTest, PitchLeverNoLongerExtendsTheEnvelopeAtMastGeometry)
+{
+	FoldrotorControl ctrl;
+	const float lever = foldrotor::FoldrotorAllocation::pitchLeverFrd();
+	const matrix::Vector3f hover(0.f, 0.f, 19.615f);
+
+	// 0.44 N*m is just past the Fx-pinned ceiling ...
+	const float My = 0.44f;
+	EXPECT_TRUE(ctrl.getAllocation().allocate(hover, matrix::Vector3f(0.f, My, 0.f)).saturated)
+			<< "0.44 N*m should be infeasible with Fx pinned";
+
+	// ... and the lever cannot rescue it either, because the Fx it needs
+	// is itself outside the box.
+	const float fx_flu = -My / lever;
+	EXPECT_GT(fabsf(fx_flu), 20.f) << "lever arm is no longer short enough to matter";
+	EXPECT_TRUE(ctrl.getAllocation().allocate(matrix::Vector3f(fx_flu, 0.f, 19.615f),
+			matrix::Vector3f(0.f, My, 0.f)).saturated)
+			<< "the lever is not expected to extend the envelope at this geometry";
+}
+
+// REGRESSION. fitWrenchToEnvelope() sacrifices horizontal force first, by
+// design. The lever component of Fx must be exempt -- it is the pitch
+// moment, not a mission objective. Without the exemption the fit silently
+// deletes the pitch command and the architecture change does nothing,
+// which is a failure mode that would look exactly like "the lever didn't
+// help" in flight.
+TEST(FoldrotorAllocationTest, FitHoldsThePitchLeverAtMomentPriority)
+{
+	FoldrotorControl ctrl;
+	// FLU, so a positive My is carried by a NEGATIVE Fx (see the sign
+	// note in PitchLeverMovesPitchFromFoldToTilt).
+	const float lever_fx = -0.05f / foldrotor::FoldrotorAllocation::pitchLeverFrd();
+	const float extra_fx = 20.f;  // the position loop's share, infeasible
+
+	matrix::Vector3f F(lever_fx + extra_fx, 0.f, 19.615f);
+	matrix::Vector3f M(0.6f, 0.05f, 0.6f);
+	const matrix::Vector3f M_commanded = M;
+
+	ASSERT_TRUE(ctrl.getAllocation().allocate(F, M).saturated) << "test case is not infeasible";
+	ctrl.fitWrenchToEnvelope(F, M, lever_fx);
+
+	EXPECT_FALSE(ctrl.getAllocation().allocate(F, M).saturated) << "fit left an infeasible wrench";
+	// The moment survived in full ...
+	EXPECT_FLOAT_EQ(M(1), M_commanded(1));
+	// ... and so did every newton of the lever. What is left of Fx beyond
+	// the lever is the position loop's surviving share: between none of it
+	// and all of it, never negative (which would mean the fit had eaten
+	// into the lever).
+	const float survived = (F(0) - lever_fx) / extra_fx;
+	EXPECT_GE(survived, 0.f) << "the fit ate into the pitch lever";
+	EXPECT_LT(survived, 1.f) << "nothing was sacrificed at all";
+}
+
+// When even the moment has to yield, the lever yields WITH it. Leaving a
+// body-x force behind that no longer corresponds to any pitch request
+// would be a standing horizontal disturbance of unknown origin.
+TEST(FoldrotorAllocationTest, FitScalesThePitchLeverWithTheMoment)
+{
+	FoldrotorControl ctrl;
+	const float lever_fx = -6.f;   // FLU
+
+	// Moment far outside anything deliverable, so step 2 has to run.
+	matrix::Vector3f F(lever_fx, 0.f, 19.615f);
+	matrix::Vector3f M(20.f, 20.f, 20.f);
+
+	ctrl.fitWrenchToEnvelope(F, M, lever_fx);
+
+	EXPECT_FALSE(ctrl.getAllocation().allocate(F, M).saturated) << "fit left an infeasible wrench";
+	EXPECT_LT(fabsf(F(0)), fabsf(lever_fx)) << "moment was cut but the lever was not";
+	EXPECT_GE(F(0) / lever_fx, 0.f) << "the lever changed sign";
+}
+
+// Passing no lever keeps the pre-2026-09-21 behaviour exactly, so the
+// existing priority guard above still describes the default path.
+TEST(FoldrotorAllocationTest, FitWithoutLeverIsUnchanged)
+{
+	FoldrotorControl ctrl;
+	matrix::Vector3f F_a(12.f, 0.f, 19.615f), F_b(12.f, 0.f, 19.615f);
+	matrix::Vector3f M_a(1.2f, 0.1f, 1.2f), M_b(1.2f, 0.1f, 1.2f);
+
+	ctrl.fitWrenchToEnvelope(F_a, M_a);
+	ctrl.fitWrenchToEnvelope(F_b, M_b, 0.f);
+
+	EXPECT_FLOAT_EQ(F_a(0), F_b(0));
+	EXPECT_FLOAT_EQ(M_a(1), M_b(1));
+}
+
+// Hover, Fz = +15.26 N (Z-up positive per allocation.md's thrust vector
+// -- see FoldrotorAllocation.hpp OPEN ITEM (c), NOT PX4 body FRD).
+//
+// The split is NEARLY even, not exactly even, as of the 2026-09-21
+// geometry correction (OPEN ITEM (d)): the moment arms are now measured
+// from the vehicle's true CoM, which model.sdf puts 0.001024 m off
+// centre in Y, so holding Mx = 0 requires the near rotor to carry
+// slightly more thrust. Hand solved via Minv*w: F1 = 7.658913 N,
+// F2 = 7.601087 N (sum = 15.26 N exactly), with beta picking up a
+// 3e-4 rad tilt from the 8.6e-5 m CoM x-offset.
+//
+// This asymmetry is the fix, not an error: the old even split left a
+// standing +0.0156 N*m roll moment at hover, which is exactly the
+// residual the bench measured as its static baseline
+// (force_moment_test.md, predicted +0.0156 vs measured +0.0159).
+TEST(FoldrotorAllocationTest, HoverProducesNearEvenSplitZeroTilt)
+{
+	foldrotor::FoldrotorAllocation alloc;
+	// 2026-09-22: hover thrust is 19.615 N, not 15.26 -- the ballast mast
+	// took the vehicle to 2.00 kg. Values re-solved through the updated
+	// Minv; the near-even-but-not-even split this test exists to pin is
+	// unchanged in kind, only in magnitude.
+	const auto out = alloc.allocate(matrix::Vector3f(0.f, 0.f, 19.615f), matrix::Vector3f(0.f, 0.f, 0.f));
+
+	EXPECT_NEAR(out.F1, 9.836426f, 1e-4f);
+	EXPECT_NEAR(out.F2, 9.778574f, 1e-4f);
+	EXPECT_NEAR(out.F1 + out.F2, 19.615f, 1e-4f);
 	EXPECT_NEAR(out.alpha1, 0.f, 1e-6f);
 	EXPECT_NEAR(out.alpha2, 0.f, 1e-6f);
-	EXPECT_NEAR(out.beta1, 0.f, 1e-5f);
-	EXPECT_NEAR(out.beta2, 0.f, 1e-5f);
+	EXPECT_NEAR(out.beta1, 0.000244f, 1e-5f);
+	EXPECT_NEAR(out.beta2, -0.000246f, 1e-5f);
 	EXPECT_FALSE(out.saturated);
 }
 
 // Hover + Mx = 0.5 N*m. Hand solved via Minv*w (both rotors' Ty stays 0,
-// so alpha is unaffected). Recomputed 2026-09-09 for the SDF-verified
-// geometry (FoldrotorAllocation.hpp OPEN ITEM (b) -- was F1=9.277405 N,
-// F2=5.987374 N, beta1=+0.020103 rad, beta2=-0.031153 rad against the
-// old s_y=+-0.15/s_z=+0.02 geometry): F1=8.557926 N, F2=6.702534 N,
-// beta1=+0.006866 rad, beta2=-0.008767 rad.
+// so alpha is unaffected). Recomputed 2026-09-21 for the sign-corrected,
+// CoM-referenced geometry (FoldrotorAllocation.hpp OPEN ITEM (d) -- was
+// F1=8.557926 N, F2=6.702534 N, beta1=+0.006866, beta2=-0.008767 against
+// the sign-inverted +-0.2684/+0.0301 geometry): F1=6.734181 N,
+// F2=8.526554 N, beta1=-0.011046 rad, beta2=+0.008724 rad.
+//
+// Note which rotor gains thrust: rotor 1 is Motor1/Arm1, which the
+// corrected constants place on body -Y in FLU, so a positive (right-hand
+// about +X) roll moment is produced by loading rotor 2, not rotor 1. The
+// pre-fix expectation had this backwards, which is the sign inversion
+// OPEN ITEM (d) describes.
 TEST(FoldrotorAllocationTest, HoverPlusRollMomentMatchesHandSolved)
 {
 	foldrotor::FoldrotorAllocation alloc;
-	const auto out = alloc.allocate(matrix::Vector3f(0.f, 0.f, 15.26f), matrix::Vector3f(0.5f, 0.f, 0.f));
+	const auto out = alloc.allocate(matrix::Vector3f(0.f, 0.f, 19.615f), matrix::Vector3f(0.5f, 0.f, 0.f));
 
-	EXPECT_NEAR(out.F1, 8.557926f, 1e-4f);
-	EXPECT_NEAR(out.F2, 6.702534f, 1e-4f);
-	EXPECT_NEAR(out.beta1, 0.006866f, 1e-5f);
-	EXPECT_NEAR(out.beta2, -0.008767f, 1e-5f);
+	EXPECT_NEAR(out.F1, 8.911594f, 1e-4f);
+	EXPECT_NEAR(out.F2, 10.703975f, 1e-4f);
+	EXPECT_NEAR(out.beta1, -0.008347f, 1e-5f);
+	EXPECT_NEAR(out.beta2, 0.006949f, 1e-5f);
 	EXPECT_FALSE(out.saturated);
 }
 
-// Hover + Mz = 0.2 N*m. Recomputed 2026-09-09 for the SDF-verified
-// geometry (was F1=7.732662 N, F2=7.584020 N, beta1=-0.085224 rad,
-// beta2=+0.086899 rad against the old geometry): F1=7.662495 N,
-// F2=7.615542 N, beta1=-0.048448 rad, beta2=+0.048747 rad.
+// Hover + Mz = 0.2 N*m. Recomputed 2026-09-21 for the sign-corrected,
+// CoM-referenced geometry (was F1=7.662495 N, F2=7.615542 N,
+// beta1=-0.048448, beta2=+0.048747): F1=7.637288 N, F2=7.640883 N,
+// beta1=+0.048788 rad, beta2=-0.048765 rad. Yaw is produced almost
+// entirely by differential tilt (beta), so the sign correction shows up
+// here as the beta pair swapping sign.
 TEST(FoldrotorAllocationTest, HoverPlusYawMomentMatchesHandSolved)
 {
 	foldrotor::FoldrotorAllocation alloc;
-	const auto out = alloc.allocate(matrix::Vector3f(0.f, 0.f, 15.26f), matrix::Vector3f(0.f, 0.f, 0.2f));
+	const auto out = alloc.allocate(matrix::Vector3f(0.f, 0.f, 19.615f), matrix::Vector3f(0.f, 0.f, 0.2f));
 
-	EXPECT_NEAR(out.F1, 7.662495f, 1e-4f);
-	EXPECT_NEAR(out.F2, 7.615542f, 1e-4f);
-	EXPECT_NEAR(out.beta1, -0.048448f, 1e-5f);
-	EXPECT_NEAR(out.beta2, 0.048747f, 1e-5f);
+	EXPECT_NEAR(out.F1, 9.812784f, 1e-4f);
+	EXPECT_NEAR(out.F2, 9.816355f, 1e-4f);
+	EXPECT_NEAR(out.beta1, 0.037965f, 1e-5f);
+	EXPECT_NEAR(out.beta2, -0.037952f, 1e-5f);
 	EXPECT_FALSE(out.saturated);
 }
 
@@ -1387,8 +2238,12 @@ TEST(FoldrotorAllocationTest, RoundTripReproducesCommandedWrench)
 	for (int c = 0; c < 3; c++) {
 		const auto out = alloc.allocate(wrenches_F[c], wrenches_M[c]);
 
-		ASSERT_NEAR(out.alpha1, 0.f, 1e-6f);
-		ASSERT_NEAR(out.alpha2, 0.f, 1e-6f);
+		// 1e-5, not 1e-6: with the CoM-referenced geometry (OPEN ITEM
+		// (d)) the pure-Mz case leaves a ~2e-6 rad residual alpha
+		// rather than an exact zero, since Ty no longer cancels to
+		// machine zero across the two rotors.
+		ASSERT_NEAR(out.alpha1, 0.f, 1e-5f);
+		ASSERT_NEAR(out.alpha2, 0.f, 1e-5f);
 
 		auto forward = [](float F, float alpha, float beta) {
 			return matrix::Vector3f(F * sinf(beta), -F * cosf(beta) * sinf(alpha), F * cosf(beta) * cosf(alpha));
@@ -1478,39 +2333,53 @@ TEST(FoldrotorAllocationTest, ThrustClampsAtFifteen)
 
 	EXPECT_NEAR(out.F1, 15.f, 1e-4f);
 	EXPECT_NEAR(out.F2, 15.f, 1e-4f);
-	EXPECT_NEAR(out.beta1, 0.f, 1e-5f);
-	EXPECT_NEAR(out.beta2, 0.f, 1e-5f);
+	// beta is the same 3e-4 rad CoM-offset residual as the hover case
+	// above (OPEN ITEM (d)), not zero -- no tilt is demanded here.
+	EXPECT_NEAR(out.beta1, 0.000244f, 1e-5f);
+	EXPECT_NEAR(out.beta2, -0.000246f, 1e-5f);
 	EXPECT_TRUE(out.saturated);
 }
 
-// F_b=(40,0,30), M_b=(0,0.8,0). Recomputed 2026-09-09 for the
-// SDF-verified geometry (FoldrotorAllocation.hpp OPEN ITEM (b)): unlike
-// the old s_y=+-0.15 geometry, T1's Ty no longer cancels to exactly 0 --
-// hand-solved via Minv*w gives T1=(20, -11.882353, 15), T2=(20,
-// 11.882353, 15), so unclamped F=27.680143 N (>15, saturates) and
-// unclamped beta1=atan2(20,hypot(-11.882353,15))=0.807469 rad (46.26
-// deg), clamped to +kMaxTilt=+0.79 rad -- the clamp still triggers
-// either way, so the assertions below are unchanged by the geometry fix.
+// beta (tilt) clamp. The stimulus was rebuilt 2026-09-21 for the
+// sign-corrected geometry (OPEN ITEM (d)). The old wrench --
+// F_b=(40,0,30), M_b=(0,0.8,0) -- no longer isolates beta: with the
+// arms referenced to the true CoM, holding My against a 40 N forward
+// force demands a huge differential Ty (+-49 N), so it is now ALPHA that
+// rails first (1.27 rad -> 0.79) and beta only reaches 0.37 rad. That
+// would still have gone green while testing the wrong channel.
+//
+// So this case is constructed from the thrust vectors instead, which is
+// exact and hand-checkable: pick T1 = T2 = (20, 0, 15), forward-map it
+// through M0 to get the wrench that demands it, and feed that in. Ty = 0
+// on both rotors by construction, so alpha stays 0 and beta alone
+// saturates: beta = atan2(20, 15) = 0.927295 rad > kMaxTilt, clamped to
+// +0.79. F = norm(20,0,15) = 25 N also clamps to 15 N.
 TEST(FoldrotorAllocationTest, TiltClampsAtPositivePointSevenNine)
 {
 	foldrotor::FoldrotorAllocation alloc;
-	const auto out = alloc.allocate(matrix::Vector3f(40.f, 0.f, 30.f), matrix::Vector3f(0.f, 0.8f, 0.f));
+	const auto out = alloc.allocate(matrix::Vector3f(40.f, 0.f, 30.f),
+					matrix::Vector3f(0.023910f, 0.680380f, -0.031880f));
 
 	EXPECT_NEAR(out.beta1, 0.79f, 1e-5f);
 	EXPECT_NEAR(out.beta2, 0.79f, 1e-5f);
+	EXPECT_NEAR(out.alpha1, 0.f, 1e-6f);
+	EXPECT_NEAR(out.alpha2, 0.f, 1e-6f);
 	EXPECT_TRUE(out.saturated);
 }
 
-// Mirror of the above: F_b=(-40,0,30), M_b=(0,-0.8,0) -> T1=(-20,
-// 11.882353, 15), T2=(-20, -11.882353, 15), unclamped
-// beta1=-0.807469 rad, clamped to -kMaxTilt=-0.79 rad.
+// Mirror of the above: T1 = T2 = (-20, 0, 15), whose forward map is
+// F_b=(-40,0,30), M_b=(0.030720, +2.197000, +0.040960). Unclamped
+// beta = atan2(-20, 15) = -0.927295 rad, clamped to -kMaxTilt = -0.79.
 TEST(FoldrotorAllocationTest, TiltClampsAtNegativePointSevenNine)
 {
 	foldrotor::FoldrotorAllocation alloc;
-	const auto out = alloc.allocate(matrix::Vector3f(-40.f, 0.f, 30.f), matrix::Vector3f(0.f, -0.8f, 0.f));
+	const auto out = alloc.allocate(matrix::Vector3f(-40.f, 0.f, 30.f),
+					matrix::Vector3f(0.023910f, -0.680380f, 0.031880f));
 
 	EXPECT_NEAR(out.beta1, -0.79f, 1e-5f);
 	EXPECT_NEAR(out.beta2, -0.79f, 1e-5f);
+	EXPECT_NEAR(out.alpha1, 0.f, 1e-6f);
+	EXPECT_NEAR(out.alpha2, 0.f, 1e-6f);
 	EXPECT_TRUE(out.saturated);
 }
 
@@ -1531,16 +2400,20 @@ TEST(FoldrotorAllocationTest, MaxTiltConstantIsPointSevenNine)
 // differential, so a per-arm sign flip would be a real bug, not
 // symmetric noise). Expected values from an independent numeric solve
 // of M0/Minv (see RoundTripReproducesCommandedWrenchWithNonzeroTy's
-// comment): alpha1=-0.548187 rad, alpha2=-0.615450 rad -- negative,
+// comment), recomputed 2026-09-21 for the sign-corrected geometry (OPEN
+// ITEM (d) -- was alpha1=-0.548187, alpha2=-0.615450):
+// alpha1=-0.522854 rad, alpha2=-0.649440 rad -- still negative on both,
 // matching alpha=atan2(-Ty,Tz) for the positive Ty this Fy produces on
-// both rotors (Control_Alloc's own +alpha -> -Ty convention).
+// both rotors (Control_Alloc's own +alpha -> -Ty convention). The
+// common-mode sign is what this test guards and it is unchanged; only
+// how the demand splits between the two arms moved.
 TEST(FoldrotorAllocationTest, PureLateralForceProducesNonzeroAlphaCorrectSign)
 {
 	foldrotor::FoldrotorAllocation alloc;
-	const auto out = alloc.allocate(matrix::Vector3f(0.f, 10.f, 15.26f), matrix::Vector3f(0.f, 0.f, 0.f));
+	const auto out = alloc.allocate(matrix::Vector3f(0.f, 10.f, 19.615f), matrix::Vector3f(0.f, 0.f, 0.f));
 
-	EXPECT_NEAR(out.alpha1, -0.548187f, 1e-5f);
-	EXPECT_NEAR(out.alpha2, -0.615450f, 1e-5f);
+	EXPECT_NEAR(out.alpha1, -0.483538f, 1e-5f);
+	EXPECT_NEAR(out.alpha2, -0.459943f, 1e-5f);
 	EXPECT_LT(out.alpha1, 0.f);
 	EXPECT_LT(out.alpha2, 0.f);
 	EXPECT_FALSE(out.saturated);
@@ -1706,27 +2579,25 @@ TEST(FoldrotorControlMappingTest, FrdToAllocatorFluNegatesYAndZOnly)
 // the way an Fz-only hover case can.
 //
 // Hand solved (standalone numpy, matching this file's established
-// style). Recomputed 2026-09-09 for the SDF-verified geometry
-// (FoldrotorAllocation.hpp OPEN ITEM (b) -- was F1=9.399402 N,
-// F2=8.848980 N, beta1=0.003968 rad, beta2=-0.004215 rad against the old
-// s_y=+-0.15/s_z=+0.02 geometry): F_alloc = (0, -10, 15.26), M_alloc =
-// (0.3, -0, -0) after the transform; allocate() through the corrected
-// Minv gives T1 = (-0.000118, -5, 7.628145), T2 = (0.000118, -5,
-// 7.631855), so
-//   F1 = 9.120778 N,  F2 = 9.123882 N
-//   beta1 = -0.000013 rad,  beta2 = 0.000013 rad
+// style). Recomputed 2026-09-21 for the sign-corrected, CoM-referenced
+// geometry (FoldrotorAllocation.hpp OPEN ITEM (d) -- was F1=9.120778 N,
+// F2=9.123882 N, beta1=-0.000013 rad, beta2=+0.000013 rad):
+// F_alloc = (0, -10, 15.26), M_alloc = (0.3, -0, -0) after the
+// transform; allocate() through the corrected Minv gives
+// T1 = (-0.128014, -5, 6.087558), T2 = (0.128014, -5, 9.172442), so
+//   F1 = 7.878757 N,  F2 = 10.447489 N
+//   beta1 = -0.016249 rad,  beta2 = 0.012253 rad
 // A bug that flips only Z (leaves Y unflipped) produces a materially
 // different result against this same corrected geometry -- F1 =
-// 10.073837 N, F2 = 8.212710 N, beta1 = 0.007011 rad,
-// beta2 = -0.008600 rad, hand-checked the same way -- so this test still
+// 9.536123 N, F2 = 8.716643 N, beta1 = +0.004265 rad,
+// beta2 = -0.004666 rad, hand-checked the same way -- so this test still
 // catches that specific partial-flip bug, not just a totally-missing
-// transform, even though beta1/beta2 are individually much smaller now
-// than under the old geometry.
+// transform.
 TEST(FoldrotorAllocationTest, LateralFrdWrenchAllocatesConsistentlyWithFullFlip)
 {
 	foldrotor::FoldrotorAllocation alloc;
 
-	const matrix::Vector3f F_b(0.f, 10.f, -15.26f);
+	const matrix::Vector3f F_b(0.f, 10.f, -19.615f);
 	const matrix::Vector3f M_b(0.3f, 0.f, 0.f);
 
 	const matrix::Vector3f F_alloc = FoldrotorControl::frdToAllocatorFlu(F_b);
@@ -1734,8 +2605,217 @@ TEST(FoldrotorAllocationTest, LateralFrdWrenchAllocatesConsistentlyWithFullFlip)
 
 	const auto out = alloc.allocate(F_alloc, M_alloc);
 
-	EXPECT_NEAR(out.F1, 9.120778f, 1e-4f);
-	EXPECT_NEAR(out.F2, 9.123882f, 1e-4f);
-	EXPECT_NEAR(out.beta1, -0.000013f, 1e-5f);
-	EXPECT_NEAR(out.beta2, 0.000013f, 1e-5f);
+	EXPECT_NEAR(out.F1, 10.820571f, 1e-4f);
+	EXPECT_NEAR(out.F2, 11.197293f, 1e-4f);
+	EXPECT_NEAR(out.beta1, -0.001622f, 1e-5f);
+	EXPECT_NEAR(out.beta2, 0.001567f, 1e-5f);
+}
+
+// --- Command-path bandwidth limit (2026-09-22) -----------------------
+//
+// Verification criteria from controller.md "Command-path bandwidth
+// limit" and the FR_WRENCH_LP param.
+//
+// WHAT THIS EXISTS TO CATCH. Log 2026-09-22/06_12_34.ulg measured the
+// joint torque needed to TRACK the commanded angles -- J*d2(theta)/dt2
+// against model.sdf's cmd_max = 5 N*m -- at 12.1 N*m rms on tilt and
+// 54.9 N*m rms on fold, over cmd_max on 52% and 89% of samples. Nothing
+// in the chain bounded the command's slew; these tests pin the piece
+// that now does.
+
+namespace
+{
+
+/** Step the filter n times at a fixed rate, returning the last output. */
+void stepWrenchLowPass(FoldrotorControl &ctrl, matrix::Vector3f &F, matrix::Vector3f &M,
+		       const matrix::Vector3f &F_in, const matrix::Vector3f &M_in,
+		       float cutoff_hz, float dt, int n)
+{
+	for (int i = 0; i < n; i++) {
+		F = F_in;
+		M = M_in;
+		ctrl.applyWrenchLowPass(F, M, cutoff_hz, dt);
+	}
+}
+
+} // namespace
+
+// Unity DC gain. A steady wrench must survive the filter untouched, or
+// every hover trim in controller_params.md shifts the moment the filter
+// is enabled. The first call seeds, so even that one is exact.
+TEST(FoldrotorWrenchLowPassTest, SteadyWrenchPassesUnchanged)
+{
+	FoldrotorControl ctrl;
+
+	const matrix::Vector3f F_in(0.4f, -0.2f, -19.615f);
+	const matrix::Vector3f M_in(0.05f, -0.01f, 0.02f);
+
+	matrix::Vector3f F = F_in;
+	matrix::Vector3f M = M_in;
+	ctrl.applyWrenchLowPass(F, M, 5.f, 0.004f);
+
+	// Seeded, not ramped: no first-cycle transient onto the actuators.
+	EXPECT_FLOAT_EQ(F(2), F_in(2));
+	EXPECT_FLOAT_EQ(M(0), M_in(0));
+
+	stepWrenchLowPass(ctrl, F, M, F_in, M_in, 5.f, 0.004f, 500);
+
+	for (int i = 0; i < 3; i++) {
+		EXPECT_NEAR(F(i), F_in(i), 1e-5f) << "force axis " << i;
+		EXPECT_NEAR(M(i), M_in(i), 1e-6f) << "moment axis " << i;
+	}
+}
+
+// THE defining property. At the 18.8 Hz actuator limit cycle measured in
+// the log, a 5 Hz corner must actually attenuate -- first-order theory
+// says 1/sqrt(1 + (18.8/5)^2) = 0.257. If this ever passes near 1.0 the
+// filter is wired but inert.
+TEST(FoldrotorWrenchLowPassTest, AttenuatesAtTheMeasuredLimitCycleFrequency)
+{
+	FoldrotorControl ctrl;
+
+	const float dt = 0.004f;          // 250 Hz rate loop
+	const float f_osc = 18.8f;        // measured yaw limit cycle
+	const float cutoff = 5.f;         // FR_WRENCH_LP default
+
+	// Drive Mz with a unit sinusoid and measure the steady-state
+	// amplitude, skipping the first 2 s of settling.
+	float peak = 0.f;
+
+	for (int i = 0; i < 2500; i++) {
+		const float t = float(i) * dt;
+		matrix::Vector3f F(0.f, 0.f, -19.615f);
+		matrix::Vector3f M(0.f, 0.f, sinf(2.f * float(M_PI) * f_osc * t));
+		ctrl.applyWrenchLowPass(F, M, cutoff, dt);
+
+		if (i > 500) {
+			peak = math::max(peak, fabsf(M(2)));
+		}
+	}
+
+	const float expected = 1.f / sqrtf(1.f + (f_osc / cutoff) * (f_osc / cutoff));
+	EXPECT_NEAR(peak, expected, 0.06f) << "5 Hz corner must cut 18.8 Hz to ~26%";
+	EXPECT_LT(peak, 0.4f);
+}
+
+// REGRESSION. The filter runs AFTER the rate loop's output clamp, and
+// fitWrenchToEnvelope() plus the conditional-integration anti-windup both
+// assume the moment they see respects those bounds. A first-order
+// low-pass is a convex combination of past samples, so it cannot exceed
+// them -- but only if the implementation never overshoots. Pin it: drive
+// a full-scale square wave at the clamp and check nothing leaves the box.
+TEST(FoldrotorWrenchLowPassTest, NeverExceedsTheBoundsOfItsInput)
+{
+	FoldrotorControl ctrl;
+
+	const matrix::Vector3f limit(1.52f, 0.22f, 2.56f);   // kRateM*Limit
+	const float dt = 0.004f;
+
+	for (int i = 0; i < 2000; i++) {
+		const float sign = (i % 7 < 3) ? 1.f : -1.f;
+		matrix::Vector3f F(0.f, 0.f, -19.615f);
+		matrix::Vector3f M = limit * sign;
+		ctrl.applyWrenchLowPass(F, M, 5.f, dt);
+
+		for (int a = 0; a < 3; a++) {
+			EXPECT_LE(fabsf(M(a)), limit(a) + 1e-5f)
+					<< "axis " << a << " left the rate loop's envelope at step " << i;
+		}
+	}
+}
+
+// FR_WRENCH_LP <= 0 must be a true bypass, so the unfiltered command path
+// stays flyable for comparison and every pre-2026-09-22 test keeps
+// exercising it. A bypassed filter must also not accumulate stale state:
+// re-enabling it has to start from the live command, not from whatever it
+// last held, or enabling the param in flight steps the actuators.
+TEST(FoldrotorWrenchLowPassTest, NonPositiveCutoffBypassesAndReseeds)
+{
+	FoldrotorControl ctrl;
+
+	// Run the filter up to a steady state at one wrench ...
+	matrix::Vector3f F(0.f, 0.f, -19.615f);
+	matrix::Vector3f M(0.f, 0.f, 0.f);
+	const matrix::Vector3f F_a(0.f, 0.f, -19.615f);
+	const matrix::Vector3f M_a(1.f, 0.f, 0.f);
+	stepWrenchLowPass(ctrl, F, M, F_a, M_a, 5.f, 0.004f, 500);
+	ASSERT_NEAR(M(0), 1.f, 1e-4f);
+
+	// ... bypass it at a very different wrench ...
+	matrix::Vector3f F_b(0.f, 0.f, -19.615f);
+	matrix::Vector3f M_b(-1.f, 0.f, 0.f);
+	ctrl.applyWrenchLowPass(F_b, M_b, 0.f, 0.004f);
+	EXPECT_FLOAT_EQ(M_b(0), -1.f) << "cutoff 0 must pass the command through untouched";
+
+	ctrl.applyWrenchLowPass(F_b, M_b, -1.f, 0.004f);
+	EXPECT_FLOAT_EQ(M_b(0), -1.f) << "negative cutoff must bypass too";
+
+	// ... and re-enabling must seed from the live command (-1), not ramp
+	// down from the stale state (+1).
+	matrix::Vector3f F_c(0.f, 0.f, -19.615f);
+	matrix::Vector3f M_c(-1.f, 0.f, 0.f);
+	ctrl.applyWrenchLowPass(F_c, M_c, 5.f, 0.004f);
+	EXPECT_FLOAT_EQ(M_c(0), -1.f) << "re-enable must re-seed, not step from stale state";
+}
+
+// A dt of zero must not divide by zero or freeze the filter; it is a
+// bypass like a non-positive cutoff. Run() can see dt == 0 on the first
+// cycle after a gate reset.
+TEST(FoldrotorWrenchLowPassTest, ZeroDtBypassesInsteadOfDividingByZero)
+{
+	FoldrotorControl ctrl;
+
+	matrix::Vector3f F(1.f, 2.f, -19.615f);
+	matrix::Vector3f M(0.3f, 0.1f, 0.2f);
+	ctrl.applyWrenchLowPass(F, M, 5.f, 0.f);
+
+	EXPECT_FLOAT_EQ(F(0), 1.f);
+	EXPECT_FLOAT_EQ(M(2), 0.2f);
+	EXPECT_TRUE(PX4_ISFINITE(M(0)));
+}
+
+// The arm-edge reset (Run()'s _wrench_lp_reset, set beside the integrator
+// resets) must seed from the live command. Without it the first armed
+// cycle puts a stale, pre-arm wrench on the actuators for one time
+// constant -- the same class of defect as the 2026-09-09 arm-time
+// integrator spike.
+TEST(FoldrotorWrenchLowPassTest, ResetSeedsFromTheLiveCommand)
+{
+	FoldrotorControl ctrl;
+
+	matrix::Vector3f F(0.f, 0.f, -19.615f);
+	matrix::Vector3f M(0.f, 0.f, 0.f);
+	const matrix::Vector3f F_pre(0.f, 0.f, -19.615f);
+	const matrix::Vector3f M_pre(0.8f, 0.f, 0.f);
+	stepWrenchLowPass(ctrl, F, M, F_pre, M_pre, 5.f, 0.004f, 500);
+	ASSERT_NEAR(M(0), 0.8f, 1e-4f);
+
+	ctrl.resetWrenchLowPass();
+
+	matrix::Vector3f F_armed(0.f, 0.f, -19.615f);
+	matrix::Vector3f M_armed(0.f, 0.f, 0.f);
+	ctrl.applyWrenchLowPass(F_armed, M_armed, 5.f, 0.004f);
+
+	EXPECT_FLOAT_EQ(M_armed(0), 0.f) << "reset must discard the pre-arm wrench";
+}
+
+// The filter must not change WHICH wrench is asked for, only how fast it
+// changes: force and moment share one corner, so a steady wrench that
+// fitWrenchToEnvelope() accepts is still accepted after filtering. Guards
+// against a future split-corner change silently making the fit's input
+// inconsistent with the lever it is handed.
+TEST(FoldrotorWrenchLowPassTest, FilteredSteadyWrenchStaysFeasible)
+{
+	FoldrotorControl ctrl;
+
+	const matrix::Vector3f F_in(0.5f, 0.3f, -15.26f);
+	const matrix::Vector3f M_in(0.2f, 0.05f, 0.3f);
+
+	matrix::Vector3f F = F_in;
+	matrix::Vector3f M = M_in;
+	stepWrenchLowPass(ctrl, F, M, F_in, M_in, 5.f, 0.004f, 500);
+
+	matrix::Vector3f F_alloc = FoldrotorControl::frdToAllocatorFlu(F);
+	matrix::Vector3f M_alloc = FoldrotorControl::frdToAllocatorFlu(M);
+	EXPECT_FALSE(ctrl.getAllocation().allocate(F_alloc, M_alloc).saturated);
 }

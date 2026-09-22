@@ -8,7 +8,7 @@ parameters:
         long: Position proportional gain, all axes (x,y,z) share this value,
           per the Simulink reference model.
       type: float
-      default: 3.0
+      default: 0.4
     FR_VEL_XY_FF:
       description:
         short: Velocity X/Y proportional gain
@@ -17,17 +17,17 @@ parameters:
           2026-09-07, see controller.md "Velocity-loop form". The name is
           kept because the param is already published.
       type: float
-      default: 6.0
+      default: 1.0
     FR_VEL_XY_I:
       description:
         short: Velocity X/Y integral gain
       type: float
-      default: 1.0
+      default: 0.2
     FR_VEL_XY_D:
       description:
         short: Velocity X/Y derivative gain
       type: float
-      default: 1.0
+      default: 0.0
     FR_VEL_Z_FF:
       description:
         short: Velocity Z proportional gain
@@ -44,44 +44,331 @@ parameters:
       default: 7.0
     FR_VEL_Z_D:
       description:
-        short: Velocity Z derivative gain
+        short: Vertical velocity derivative gain
+        long: |
+          Zero as of 2026-09-22, same reasoning as FR_RATE_*_D: with
+          F = FF*e_v + I*int(e_v) - D*vel_dot against m*vel_dot = F, the
+          D term is synthetic mass (D/m = 0.1/2.0 = 5%), not damping.
+          Its input, vehicle_local_position.az, carried 19.6 m/s^2 rms
+          of airframe vibration in log 2026-09-22/06_12_34.ulg, which
+          this gain turned into 1.96 N rms of the 2.82 N rms commanded
+          Fz -- the largest single contributor to collective-thrust
+          chatter. See findings.md 2026-09-22 (13).
       type: float
-      default: 0.1
+      default: 0.0
     FR_VEL_Z_GRAV_FF:
       description:
         short: Velocity Z gravity feedforward
-        long: Explicit gravity feedforward on the Z velocity loop, per the
-          Simulink reference model.
+        long: >-
+          Force-domain gravity feedforward on the Z velocity loop, the
+          vehicle's own weight in newtons, not the raw 9.81 m/s^2
+          acceleration literal. controller.md's translational dynamics
+          equation (p_ddot = R*F_b/m - [0,0,g]) requires the Fz feedforward
+          to equal mg for a level hover, not m*0 + g. Value is the
+          2026-09-09 Part D bench-measured static weight
+          (findings.md, "(4)" entry), a direct measurement, not a
+          computed mass estimate. Resolves controller.md's Open questions
+          3 and 4 (2026-09-09) as under-scaled, not a units/sign swap; see
+          that section for the derivation.
       type: float
-      default: 9.81
+      default: 15.260017
+    FR_VEL_Z_I_LIM:
+      description:
+        short: Velocity Z integrator windup limit
+        long: >-
+          Symmetric bound on FR_VEL_Z_I's accumulated integral itself, in
+          newtons of Z-axis force -- a separate mechanism from the
+          conditional-integration anti-windup, which stays inert until
+          the allocator (step 4d) supplies real output bounds. Set
+          2026-09-09 (findings.md), after FR_VEL_Z_GRAV_FF was fixed to
+          supply the full measured hover weight: the integrator no
+          longer needs to make up a structural feedforward gap, only
+          real trim/disturbance, so its own contribution to Fz is capped
+          well below the hover weight rather than left unbounded. No
+          equivalent param exists for X/Y; that is an open decision, not
+          an oversight.
+      type: float
+      default: 3.0
+    FR_VEL_XY_I_LIM:
+      description:
+        short: Velocity X/Y integrator windup limit
+        long: >-
+          Symmetric bound on FR_VEL_XY_I's accumulated integral, in newtons
+          of X/Y-axis force. Mirrors FR_VEL_Z_I_LIM.
+      type: float
+      default: 0.3
+    FR_VEL_XY_MAX:
+      description:
+        short: Maximum horizontal velocity setpoint
+        long: >-
+          Clamps the position loop's horizontal velocity setpoint
+          (PositionVelocityControl's vel_sp.xy(), before the velocity PID)
+          -- mc_pos_control's setVelocityLimits()/constrainXY() equivalent,
+          added 2026-09-17 after real SITL testing showed that without it,
+          an ordinary position-setpoint step demands more instantaneous
+          force than the FR_VEL_XY_FF gain can produce without hitting the
+          combined force-magnitude sphere (kPosVelForceLimit) immediately,
+          starving the attitude loop of the rotor-thrust headroom it needs
+          to produce any moment and driving fold/tilt to their rails
+          within milliseconds of arming -- see findings.md's 2026-09-17
+          entry. First-cut placeholder, sized so FR_VEL_XY_FF *
+          FR_VEL_XY_MAX leaves comfortable headroom under the sphere cap
+          alongside FR_VEL_Z_GRAV_FF; NOT yet verified against a logged
+          step response.
+      type: float
+      min: 0.0
+      default: 1.0
+    FR_VEL_Z_MAX_UP:
+      description:
+        short: Maximum climb velocity setpoint
+        long: >-
+          Clamps the position loop's Z velocity setpoint on the climb
+          (upward, negative-Z-NED) side. See FR_VEL_XY_MAX for why this
+          exists; same 2026-09-17 addition.
+
+          Lowered 1.0 -> 0.3 on 2026-09-21 to buy back roll authority.
+          This param sets the collective thrust commanded at takeoff:
+          Fz = FR_VEL_Z_GRAV_FF + FR_VEL_Z_FF * FR_VEL_Z_MAX_UP, so 1.0
+          m/s asked for 22.26 N -- 1.46x hover -- from a standstill on
+          the ground. Roll is produced by DIFFERENTIAL thrust out of the
+          same per-rotor [0, 15] N budget the collective spends, so that
+          climb command cut deliverable roll from ~4.0 to ~2.2 N*m while
+          the rate loop was still permitted to ask for 3.8, and the
+          allocator saturated on 96% of samples from the instant of
+          arming (findings.md 2026-09-21 (3)). At 0.3 m/s, Fz = 17.4 N
+          and roll authority recovers to ~3.5 N*m.
+
+          Tradeoff: slower takeoff. Still a first-cut value -- it trades
+          climb rate for control margin, and the right split needs a
+          clean hover to confirm.
+      type: float
+      min: 0.0
+      default: 0.3
+    FR_VEL_Z_MAX_DN:
+      description:
+        short: Maximum descent velocity setpoint
+        long: >-
+          Clamps the position loop's Z velocity setpoint on the descent
+          (downward, positive-Z-NED) side. Deliberately kept lower than
+          FR_VEL_Z_MAX_UP, mirroring mc_pos_control's MPC_Z_VEL_MAX_DN <
+          MPC_Z_VEL_MAX_UP convention (descending too fast is the riskier
+          direction). See FR_VEL_XY_MAX for why this exists.
+      type: float
+      min: 0.0
+      default: 0.7
     FR_ATT_P:
       description:
         short: Attitude P gain
         long: Attitude proportional gain, all axes (phi,theta,psi) share this
           value, per the Simulink reference model.
       type: float
-      default: 3.0
-    FR_RATE_RP_FF:
+      default: 2.0
+    FR_PITCH_LEVER:
       description:
-        short: Roll/pitch rate proportional gain
-        long: Despite the _FF suffix, this is the P gain applied to the
+        short: Fraction of pitch moment routed through the body-x tilt lever
+        long: >-
+          0 routes the whole commanded pitch moment through differential
+          FOLD (alpha), which is what the allocator does when body-x force
+          is pinned to the position loop's request. 1 routes it entirely
+          through body-x force acting on the rotors' 5.5 cm below-CoM
+          offset, which the allocator realises with differential TILT
+          (beta) and which drives the differential fold command to zero.
+
+          Why this parameter exists. Pitch is the only axis this airframe
+          actuates through a servo rather than through differential
+          thrust, and at FR_PITCH_LEVER = 0 it is routed down the worst
+          available path. Measured against model.sdf, per 0.1 N*m of
+          commanded pitch:
+
+            lever = 0 : fold  16.3 deg, actuator 6.1 Hz, zeta 0.48
+            lever = 1 : tilt   6.8 deg, actuator 20.5 Hz, zeta 1.61
+
+          The fold sub-chain carries 0.0136 kg*m^2 about its axis, the
+          tilt sub-chain 0.0012 -- 11x lighter, so the same joint PID
+          (p=20, d=0.5 in model.sdf) is 3.4x faster and properly damped.
+          That matters because the pitch axis is OPEN-LOOP UNSTABLE at
+          2.77 Hz (dMy/dtheta = 0.94 N*m/rad on Iyy = 0.00309, findings.md
+          (9)), needing roughly 8.3 Hz of loop bandwidth to stabilise.
+          6.1 Hz cannot do it at any gain; 20.5 Hz can.
+
+          It also raises the authority itself. Holding hover thrust with
+          Fx pinned to zero the airframe can produce at most 0.342 N*m of
+          pitch (fold hits its +-0.79 rad rail); letting Fx move buys
+          0.0549 N*m per newton, to 1.49 N*m at the actuator box corner.
+
+          The cost is real and is the reason this is a parameter rather
+          than a constant: 1.82 N of unwanted body-x force per 0.1 N*m of
+          pitch, i.e. the vehicle accelerates horizontally while it
+          corrects pitch. That is the same trade findings.md (9) already
+          accepted in the other direction ("recovering attitude first and
+          accepting the position error is the only ordering that
+          converges").
+
+          REVISED 2026-09-22, default 1.0 -> 0.0. The ballast mast
+          (model.sdf `ballast_link`) moved the CoM BELOW the rotor plane,
+          so kS1z changed sign and the lever arm shrank from 0.0549 to
+          0.0170 N*m/N. Two consequences: the lever is now 3.2x weaker
+          (5.9 N of body-x force per 0.1 N*m instead of 1.8 N), and --
+          far more important -- the pitch axis is no longer open-loop
+          UNSTABLE, so the bandwidth argument that justified the lever
+          has gone away. Pitch now has a RESTORING 0.334 N*m/rad against
+          0.440 N*m of authority, i.e. a stable equilibrium over +-76 deg.
+          Paying 5.9 N of unwanted horizontal force to actuate a stable
+          axis is a bad trade, so the lever is off by default.
+
+          It is kept, not deleted, because the mechanism is real and
+          correct for any geometry where the rotors sit far from the CoM.
+          Raise it only with a measured reason.
+      type: float
+      min: 0.0
+      max: 1.0
+      default: 0.0
+    FR_WRENCH_LP:
+      description:
+        short: Commanded-wrench low-pass cutoff
+        long: |
+          First-order low-pass corner, in hertz, applied to the commanded
+          body force and moment after the rate loop's output clamp and
+          before allocation. Zero or negative disables the filter, which
+          restores the pre-2026-09-22 unfiltered command path.
+
+          Bounds the command's SLEW, which nothing previously did: the
+          rate loop emits at 250 Hz and the allocator is an algebraic
+          map, so any frequency content in the wrench lands directly on
+          alpha/beta. Measured in log 2026-09-22/06_12_34.ulg, the
+          torque needed to TRACK the commanded angle (J*d2(theta)/dt2
+          against model.sdf's cmd_max = 5 N*m) was 12.1 N*m rms on tilt
+          and 54.9 N*m rms on fold, over cmd_max on 52% and 89% of
+          samples. The servos were saturated most of the flight.
+
+          5.0 Hz sits an order of magnitude above every closed-loop
+          bandwidth (0.36 Hz pitch, 0.46 Hz roll, 0.62 Hz yaw) and below
+          both actuator dominant poles (7.1 Hz tilt, 6.1 Hz fold), so it
+          costs ~7 deg of phase at the fastest loop. See controller.md
+          "Command-path bandwidth limit" and findings.md 2026-09-22 (13).
+      type: float
+      default: 5.0
+    FR_RATE_R_FF:
+      description:
+        short: Roll rate proportional gain
+        long: >-
+          Despite the _FF suffix, this is the P gain applied to the
           rate error, not a feedforward on the setpoint — decided
           2026-09-07, see controller.md "Attitude/rate-loop form". Note
           this differs from PX4's own rate controller, which has a
           separate setpoint feedforward term. The name is kept because
           the param is already published.
+
+          Split from the former shared FR_RATE_RP_FF on 2026-09-21; roll
+          keeps the Simulink value, pitch does not. See FR_RATE_P_FF.
       type: float
-      default: 3.5
-    FR_RATE_RP_I:
+      default: 0.49
+    FR_RATE_R_I:
       description:
-        short: Roll/pitch rate integral gain
-      type: float
-      default: 0.1
-    FR_RATE_RP_D:
-      description:
-        short: Roll/pitch rate derivative gain
+        short: Roll rate integral gain
       type: float
       default: 0.5
+    FR_RATE_R_I_LIM:
+      description:
+        short: Roll rate integrator windup limit
+        long: >-
+          Symmetric bound on FR_RATE_R_I's accumulated integral, in
+          newton-meters of roll moment. Mirrors FR_VEL_Z_I_LIM.
+      type: float
+      default: 0.4
+    FR_RATE_R_D:
+      description:
+        short: Roll rate derivative gain
+        long: |
+          Zero as of 2026-09-22. With M = FF*e_r + I*int(e_r) - D*rate_dot
+          against a plant I_body*rate_dot = M, the D term collects as
+          (I_body + D)*rate_dot = FF*e_r: it is SYNTHETIC INERTIA, not
+          damping. Damping comes from the rate loop's P closing on the
+          attitude loop. D/I_body was only 0.013/0.1025 = 13%, negligible at the
+          0.46 Hz closed-loop bandwidth, while D's gain rises with
+          frequency and dominated at the 18.8 Hz actuator limit cycle.
+          Measured in log 2026-09-22/06_12_34.ulg: the D term supplied
+          0.25 N*m rms of the 0.27 N*m commanded Mx. See findings.md 2026-09-22 (13).
+      type: float
+      default: 0.0
+    FR_RATE_P_FF:
+      description:
+        short: Pitch rate proportional gain
+        long: >-
+          Same meaning as FR_RATE_R_FF (a P gain on rate error, not a
+          setpoint feedforward).
+
+          Roll and pitch shared one gain (FR_RATE_RP_FF = 3.5) until
+          2026-09-21, inherited from a Simulink model whose inertia the
+          user confirmed is NOT this airframe's. Against model.sdf's
+          actual inertia about the true centre of mass, the two axes are
+          not comparable: Ixx = 0.0645 but Iyy = 0.0031 kg*m^2, so the
+          shared gain gave pitch a P/I ratio of 1131/s against roll's
+          54/s. Pitch also has ~11x less moment authority at hover
+          (0.34 vs 3.83 N*m, see FoldrotorControl.cpp's kRateMyLimit).
+
+          Default is the roll gain scaled by Iyy/Ixx, so the two axes
+          have matched closed-loop bandwidth rather than matched gain.
+
+          REVISED 2026-09-22 for the ballast mast: 0.443 kg at z = -0.30 m
+          raises Iyy from 0.00309 to 0.04108 (13.3x) while Ixx goes
+          0.06447 -> 0.10247 (1.6x), so the ratio moves 0.048 -> 0.401 and
+          this gain with it, 0.049 -> 0.196. The pitch axis is no longer
+          the freakishly light one -- 21x lighter than roll before, 2.5x
+          now.
+
+          BUT the Iyy/Ixx-matched value is NOT what ships. 0.196 rails the
+          rate loop at 0.96 rad/s, below the 1.57 rad/s the attitude loop
+          commands at its 45 deg design error, because the pitch moment
+          ENVELOPE (0.188 N*m at the 19.615 N hover) did not grow with the
+          inertia. The envelope is a hard physical limit and the matched-
+          bandwidth rule is only a heuristic, so the envelope wins:
+          0.188 / 1.571 = 0.1197 is the ceiling, and this ships at 0.11
+          for margin. Guarded by RateLoopStaysLinearOverAttitudeLoopDemand.
+
+          CONSEQUENCE, stated rather than hidden: roll and pitch no longer
+          have matched closed-loop bandwidth. Pitch is deliberately the
+          slower axis. That is acceptable only because the mast made the
+          pitch axis open-loop STABLE (restoring 0.334 N*m/rad) so it no
+          longer needs bandwidth to avoid departing -- it would not have
+          been acceptable before. NOT flight-tuned; needs a clean hover.
+      type: float
+      default: 0.11
+    FR_RATE_P_I:
+      description:
+        short: Pitch rate integral gain
+        long: >-
+          Held at roll's I/FF ratio (1.02) against the envelope-limited
+          FR_RATE_P_FF, so the pitch loop keeps roll's P:I balance rather
+          than roll's absolute gain. 2026-09-22.
+      type: float
+      default: 0.112
+    FR_RATE_P_I_LIM:
+      description:
+        short: Pitch rate integrator windup limit
+        long: >-
+          Symmetric bound on FR_RATE_P_I's accumulated integral, in
+          newton-meters of pitch moment. Sized to the pitch moment the
+          allocator can actually deliver at hover (0.440 N*m as of the
+          2026-09-22 ballast mast, was 0.34), not to roll's much larger
+          budget.
+      type: float
+      default: 0.05
+    FR_RATE_P_D:
+      description:
+        short: Pitch rate derivative gain
+        long: |
+          Zero as of 2026-09-22. With M = FF*e_r + I*int(e_r) - D*rate_dot
+          against a plant I_body*rate_dot = M, the D term collects as
+          (I_body + D)*rate_dot = FF*e_r: it is SYNTHETIC INERTIA, not
+          damping. Damping comes from the rate loop's P closing on the
+          attitude loop. D/I_body was only 0.0029/0.0411 = 7%, negligible at the
+          0.36 Hz closed-loop bandwidth, while D's gain rises with
+          frequency and dominated at the 18.8 Hz actuator limit cycle.
+          Measured in log 2026-09-22/06_12_34.ulg: the D term supplied
+          0.02 N*m rms of the 0.04 N*m commanded My. See findings.md 2026-09-22 (13).
+      type: float
+      default: 0.0
     FR_RATE_YAW_FF:
       description:
         short: Yaw rate proportional gain
@@ -92,7 +379,7 @@ parameters:
           separate setpoint feedforward term. The name is kept because
           the param is already published.
       type: float
-      default: 2.5
+      default: 0.62
     FR_RATE_YAW_I:
       description:
         short: Yaw rate integral gain
@@ -103,7 +390,20 @@ parameters:
     FR_RATE_YAW_D:
       description:
         short: Yaw rate derivative gain
-        long: Zero per the Simulink reference model — see controller.md's
-          open question on whether this is deliberate.
+        long: |
+          Zero as of 2026-09-22. With M = FF*e_r + I*int(e_r) - D*rate_dot
+          against a plant I_body*rate_dot = M, the D term collects as
+          (I_body + D)*rate_dot = FF*e_r: it is SYNTHETIC INERTIA, not
+          damping. Damping comes from the rate loop's P closing on the
+          attitude loop. D/I_body was only 0.013/0.0681 = 19%, negligible at the
+          0.62 Hz closed-loop bandwidth, while D's gain rises with
+          frequency and dominated at the 18.8 Hz actuator limit cycle.
+          Measured in log 2026-09-22/06_12_34.ulg: the D term supplied
+          1.14 N*m rms of the 1.30 N*m commanded Mz. See findings.md 2026-09-22 (13).
+
+          Back to the committed value. This was raised to 0.013 during
+          the 2026-09-21 pitch work without updating this description,
+          which continued to read "zero per the Simulink reference
+          model" -- the disagreement flagged 2026-09-22.
       type: float
       default: 0.0

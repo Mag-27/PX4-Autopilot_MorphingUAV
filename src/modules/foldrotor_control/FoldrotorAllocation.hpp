@@ -34,15 +34,17 @@
  *    breaks the round-trip identity by construction; this class does not
  *    attempt to redistribute authority across the two rotors after a
  *    clamp.
- * 4. The geometry constants (kDragRatio, kS1y, kS1z, kS2y, kS2z) match the
- *    SDF-verified rotor geometry (RESOLVED 2026-09-09 -- see OPEN ITEM
- *    (b)): s_y = +-0.2684 m, s_z = +0.0301 m, per allocation.md's
- *    "Actuator geometry / effectiveness matrix" table. Previously s_y
- *    was +-0.15 m and s_z +0.02 m, a deferred mismatch (user decision
- *    2026-09-06) that produced a ~1.8x roll response versus commanded --
- *    fixed here, not before, because it needed the SITL bench evidence
- *    (findings.md 2026-09-09 (2)) that made it worth resolving now
- *    rather than staying deferred.
+ * 4. The geometry constants (kDragRatio, kS1y, kS1z, kS2y, kS2z) are
+ *    body FLU, measured from the vehicle's true centre of mass, and are
+ *    asserted directly against model.sdf's forward kinematics by
+ *    FoldrotorAllocationTest.GeometryConstantsMatchSdfForwardKinematics
+ *    (allocation.md's long-planned "Geometry-vs-SDF test"). Their signs
+ *    and reference point were corrected 2026-09-21 -- see OPEN ITEM (d)
+ *    for what was wrong and why it inverted every moment axis. The
+ *    magnitudes' earlier correction (s_y +-0.15 -> +-0.2684 m, s_z
+ *    0.02 -> 0.0301 m, RESOLVED 2026-09-09, OPEN ITEM (b)) still stands;
+ *    2026-09-21 changed the signs and moved the reference point from the
+ *    base_link origin to the true CoM (s_z 0.0301 -> -0.0549 m).
  *
  * ---------------------------------------------------------------------
  * OPEN ITEMS — carried, not resolved. Do not "fix" these without a
@@ -98,6 +100,39 @@
  *     contract is therefore: F_b/M_b in, body FLU, matching
  *     Control_Alloc.m's own frame -- the caller is responsible for
  *     getting there.
+ *
+ * (d) Moment-block sign/reference-point error -- RESOLVED 2026-09-21.
+ *     The constants were transcribed from Control_Alloc.m, whose frame
+ *     the user confirmed (2026-09-21) is Z-up with ITS rotor 1 on +Y --
+ *     i.e. FLU, the same handedness this class expects. Two things were
+ *     nonetheless wrong, and together they negated M0's entire moment
+ *     block, so every commanded moment came out with the opposite sign:
+ *
+ *       1. Rotor LABELS. Control_Alloc's "rotor 1" (at +Y in FLU) is
+ *          physically Motor2/Arm2; FoldrotorControl.cpp wires allocator
+ *          rotor 1 -> Motor1/Arm1, which is at -Y in FLU. The channel
+ *          wiring is bench-verified, so the constants were re-signed to
+ *          match it (user decision 2026-09-21) rather than swapping the
+ *          channels: kS1y is now negative, kS2y positive.
+ *       2. Z REFERENCE POINT and sign. s_z = +0.0301 m is the rotor
+ *          height relative to the base_link ORIGIN, sign-flipped; the
+ *          moment arm the vehicle actually rotates about is relative to
+ *          the CoM, which sits 0.0248 m above that origin, giving
+ *          -0.0549 m in FLU.
+ *
+ *     kDragRatio was separately 31% low (0.017 from Control_Alloc vs the
+ *     SDF's momentConstant 0.022274, bench-measured 0.02225) and is now
+ *     the SDF value, negated for the same labelling reason (rotor 1 =
+ *     Prop1, ccw, reacts along -T). User decision 2026-09-21: the SDF
+ *     value is the source of truth, not Control_Alloc's.
+ *
+ *     Measured effect of the bug, with the real allocator driven against
+ *     a forward-kinematics model of model.sdf (the study lives in
+ *     sitl_testing/allocation_study/, findings.md 2026-09-21): a small
+ *     commanded moment at hover produced -1.00x (Mx), -1.31x (My) and
+ *     -1.00x (Mz) of what was asked -- positive feedback on all three
+ *     rate loops. Guarded now by
+ *     FoldrotorAllocationTest.CommandedMomentProducesSameSignPhysicalMoment.
  *
  ****************************************************************************/
 
@@ -166,6 +201,22 @@ public:
 	/** True if Minv was successfully derived from M0 at construction. */
 	bool isValid() const { return _valid; }
 
+	/**
+	 * Pitch moment produced per newton of BODY-FORWARD force, N*m/N,
+	 * body FRD -- the "tilt lever".
+	 *
+	 * The rotors sit |kS1z| = 5.5 cm BELOW the true CoM, so any body-x
+	 * force acts on a lever about the pitch axis: My_frd = +0.0549 * Fx.
+	 * FRD, so the sign is flipped from kS1z's native FLU.
+	 *
+	 * This is the same physical term as findings.md 2026-09-21 (9)'s
+	 * pitch-destabilising feedback path. It is exposed here because it is
+	 * also the vehicle's STRONGEST pitch actuator, and the controller has
+	 * to be able to aim it deliberately rather than only fence it off.
+	 * See FoldrotorControl::Run()'s pitch-lever block.
+	 */
+	static constexpr float pitchLeverFrd() { return -kS1z; }
+
 	/** Read-only access to the derived inverse, for the Minv*M0 ~= I test. */
 	const matrix::SquareMatrix<float, 6> &getMinv() const { return _Minv; }
 	const matrix::SquareMatrix<float, 6> &getM0() const { return _M0; }
@@ -191,7 +242,6 @@ public:
 		w(3) = M_b(0); w(4) = M_b(1); w(5) = M_b(2);
 
 		const matrix::Vector<float, 6> T = _Minv * w;
-
 		allocateRotor(T(0), T(1), T(2), out.F1, out.alpha1, out.beta1, out.saturated);
 		allocateRotor(T(3), T(4), T(5), out.F2, out.alpha2, out.beta2, out.saturated);
 
@@ -207,11 +257,26 @@ private:
 	// (RESOLVED 2026-09-09 -- see OPEN ITEM (b) and decision 4 above;
 	// previously s_y = +-0.15 m, s_z = +0.02 m, a deferred mismatch that
 	// produced ~1.8x roll response versus commanded).
-	static constexpr float kDragRatio = 0.017f; // k, drag/thrust ratio
-	static constexpr float kS1y = 0.2684f;      // rotor 1 y-offset, m (SDF-verified)
-	static constexpr float kS1z = 0.0301f;      // rotor 1 z-offset, m (SDF-verified)
-	static constexpr float kS2y = -0.2684f;     // rotor 2 y-offset, m (SDF-verified)
-	static constexpr float kS2z = 0.0301f;      // rotor 2 z-offset, m (SDF-verified)
+	// Signs and reference point corrected 2026-09-21 -- see OPEN ITEM (d).
+	// All five are body FLU (the frame allocate() is fed, per OPEN ITEM
+	// (c)) and measured from the vehicle's TRUE centre of mass, asserted
+	// against model.sdf's forward kinematics by
+	// FoldrotorAllocationTest.GeometryConstantsMatchSdfForwardKinematics.
+	// Rotor 1 is Motor1/Arm1, which sits on body -Y in FLU.
+	static constexpr float kDragRatio = -0.022274f; // k, drag/thrust ratio; SDF momentConstant,
+	// negative because rotor 1 (Prop1, ccw) reacts along -T
+	//
+	// UPDATED 2026-09-22 for the ballast mast (model.sdf `ballast_link`,
+	// 0.443 kg at z = -0.30 m, total 2.00 kg). The CoM moved from
+	// z = +0.0248 to z = -0.0471, so kS1z/kS2z CHANGED SIGN: the rotors
+	// now sit 1.7 cm ABOVE the CoM instead of 5.5 cm below it. That sign
+	// is the whole point of the mast -- it flips the body-horizontal-force
+	// coupling from pitch-destabilising (+0.94 N*m/rad) to RESTORING
+	// (-0.33 N*m/rad). See findings.md 2026-09-22.
+	static constexpr float kS1y = -0.267583f;   // rotor 1 y-offset, m (FLU, rel. true CoM)
+	static constexpr float kS1z = +0.017010f;   // rotor 1 z-offset, m (FLU, rel. true CoM)
+	static constexpr float kS2y = 0.269177f;    // rotor 2 y-offset, m (FLU, rel. true CoM)
+	static constexpr float kS2z = +0.017009f;   // rotor 2 z-offset, m (FLU, rel. true CoM)
 
 	/**
 	 * Invert one rotor's thrust vector T = (Tx, Ty, Tz) back to

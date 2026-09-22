@@ -16,9 +16,11 @@
 # pure math, listed in SRCS for visibility only — no DEPENDS beyond the
 # mathlib already present. Step 4e part 1 adds CascadeRateGate.hpp (the
 # multi-rate gating mechanism) and wires all four into Run(), computing a
-# real wrench every cycle -- but publishes it nowhere. Allocation
-# (FoldrotorAllocation, 4d) and the actuator_motors/actuator_servos
-# publish are still to come.
+# real wrench every cycle. Step 4e part 2 adds FoldrotorAllocation.hpp
+# (step 4d, header-only pure math, same as the cascade classes) and wires
+# it into Run() so the module publishes actuator_motors/actuator_servos
+# every cycle -- see .claude/plans/step-4e-allocation-plan.md for open
+# items still outstanding before free flight.
 #
 ############################################################################
 
@@ -34,6 +36,7 @@ px4_add_module(
 		PositionVelocityControl.hpp
 		AttitudeRateControl.hpp
 		CascadeRateGate.hpp
+		FoldrotorAllocation.hpp
 	MODULE_CONFIG
 		foldrotor_control_params.yaml
 	DEPENDS

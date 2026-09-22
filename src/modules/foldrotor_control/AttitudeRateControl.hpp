@@ -5,7 +5,7 @@
  * Implements the second half of .claude/specs/controller.md's "Structure
  * (confirmed from Simulink)" cascade:
  *
- *     attitude P (FR_ATT_P) -> rate PID (FR_RATE_RP_*, FR_RATE_YAW_*)
+ *     attitude P (FR_ATT_P) -> rate PID (FR_RATE_R_*, FR_RATE_P_*, FR_RATE_YAW_*)
  *         -> M_b = (Mx_b, My_b, Mz_b), body/FRD
  *
  * The output is matrix::Vector3f in body/FRD, which is what
@@ -142,17 +142,26 @@ public:
 	void setAttitudeGain(float p) { _att_p = p; }
 
 	/**
-	 * Rate-loop gains. The first argument of each triple is
-	 * FR_RATE_*_FF, which is the P gain on the rate error (decision 1).
-	 * Roll/pitch and yaw are separate because their gains differ:
-	 * 3.5/0.1/0.5 against 2.5/0/0.
+	 * Rate-loop gains, one triple per axis. The first argument of each
+	 * triple is FR_RATE_*_FF, which is the P gain on the rate error
+	 * (decision 1).
+	 *
+	 * Roll and pitch took a SHARED gain (FR_RATE_RP_*) until 2026-09-21,
+	 * transcribed from Simulink where they were tuned together. They are
+	 * separate now because this airframe's two axes are not comparable:
+	 * model.sdf's inertia about the true CoM is Ixx = 0.0645 but
+	 * Iyy = 0.0031 kg*m^2 -- pitch is ~21x lighter, and its moment
+	 * authority at hover is ~11x smaller (0.34 vs 3.83 N*m). One gain
+	 * cannot suit both. See findings.md 2026-09-21 (2) and
+	 * controller_params.md.
 	 */
-	void setRateGains(float rp_ff, float rp_i, float rp_d,
+	void setRateGains(float roll_ff, float roll_i, float roll_d,
+			  float pitch_ff, float pitch_i, float pitch_d,
 			  float yaw_ff, float yaw_i, float yaw_d)
 	{
-		_rate_p = matrix::Vector3f(rp_ff, rp_ff, yaw_ff);
-		_rate_i = matrix::Vector3f(rp_i, rp_i, yaw_i);
-		_rate_d = matrix::Vector3f(rp_d, rp_d, yaw_d);
+		_rate_p = matrix::Vector3f(roll_ff, pitch_ff, yaw_ff);
+		_rate_i = matrix::Vector3f(roll_i, pitch_i, yaw_i);
+		_rate_d = matrix::Vector3f(roll_d, pitch_d, yaw_d);
 	}
 
 	/**

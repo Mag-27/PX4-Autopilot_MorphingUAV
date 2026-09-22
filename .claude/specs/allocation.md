@@ -244,7 +244,52 @@ PX4/Gazebo, where the plant is the verified SDF geometry — confirmed
 the predicted symptom (an immediate "Attitude failure (roll)" at arm),
 detailed in `findings.md`'s 2026-09-09 (2) entry and `controller.md`.
 
-**Status: fixed 2026-09-09.** Deferred by user decision 2026-09-06,
+### Sign / reference-point error — RESOLVED 2026-09-21
+
+The magnitudes fixed in 2026-09-09 (below) were right; their **signs and
+reference point were not**, and the error negated `M0`'s entire moment
+block, inverting all three commanded moment axes.
+
+| quantity | pre-2026-09-21 | corrected (body FLU, rel. true CoM) |
+|---|---|---|
+| rotor 1 y-offset (`kS1y`) | +0.2684 m | **−0.267356 m** |
+| rotor 2 y-offset (`kS2y`) | −0.2684 m | **+0.269404 m** |
+| rotor z-offset (`kS1z`/`kS2z`) | +0.0301 m | **−0.054924 / −0.054926 m** |
+| drag/thrust ratio (`kDragRatio`) | +0.017 | **−0.022274** |
+
+Two independent causes, both settled by user decision 2026-09-21:
+
+1. **Rotor labels.** `Control_Alloc.m`'s frame is Z-up with *its* rotor 1
+   on +Y (user-confirmed) — i.e. FLU, the handedness this module already
+   feeds the allocator. But that rotor is physically **Motor2/Arm2**;
+   `FoldrotorControl.cpp` wires allocator rotor 1 → Motor1/Arm1, which
+   sits on −Y in FLU. The channel wiring is bench-verified, so the
+   constants were re-signed to match it rather than swapping channels.
+2. **Z reference point.** `+0.0301 m` is the rotor height relative to the
+   `base_link` **origin**, sign-flipped. The moment arm the vehicle
+   rotates about is relative to the **CoM**, which sits 0.0248 m above
+   that origin → −0.0549 m in FLU.
+
+`kDragRatio` was separately 31% low: `Control_Alloc.m`'s 0.017 against
+`model.sdf`'s `momentConstant` 0.022274 (bench-measured 0.02225). User
+decision 2026-09-21: **the SDF value is the source of truth.**
+
+Measured effect, driving the real allocator against an SDF
+forward-kinematics model (`src/modules/foldrotor_control/sitl_testing/
+allocation_study/`, `findings.md` 2026-09-21): a small commanded moment
+at hover produced **−1.00× (Mx), −1.31× (My), −1.00× (Mz)** of what was
+asked — positive feedback on all three rate loops, and the cause of the
+repeated free-flight flips.
+
+Now guarded by two tests that did not previously exist, both of which
+fail against the old constants:
+`FoldrotorAllocationTest.GeometryConstantsMatchSdfForwardKinematics`
+(this spec's long-planned "Geometry-vs-SDF test") and
+`FoldrotorAllocationTest.CommandedMomentProducesSameSignPhysicalMoment`
+(the force/moment-direction tier). Both build their expectation from SDF
+geometry with explicit cross products, never from `M0`.
+
+**Status: magnitudes fixed 2026-09-09.** Deferred by user decision 2026-09-06,
 re-opened and resolved once SITL evidence made it the confirmed cause
 rather than a hypothetical one. `FoldrotorAllocation.hpp`'s `kS1y`/
 `kS2y`/`kS1z`/`kS2z` now use the SDF-verified values directly (±0.2684 m,
@@ -286,8 +331,9 @@ Minv = [ ...
      0.0000000000  -0.0658212295  +0.5000000000  -3.2910614770    0.0000000000   -0.3729869674];
 ```
 
-**Current `Minv` literal (s1y/s2y=±0.2684, s1z/s2z=+0.0301, k=0.017) —
-matches `FoldrotorControlTest.cpp`'s `kSpecMinv` as of 2026-09-09.**
+**Superseded `Minv` literal (s1y/s2y=±0.2684, s1z/s2z=+0.0301, k=0.017)
+— SUPERSEDED 2026-09-21 by the sign/reference-point fix above. Kept only
+as history; its moment block has the wrong sign throughout.**
 
 ```matlab
 % det(M0) = -9.836548e-3, cond(M0) = 58.88 -> full rank, pinv == inv
@@ -298,6 +344,21 @@ Minv = [ ...
     +0.5000000000  -0.0035373791   0.0000000000  -0.1175209007    0.0000000000   +1.8554476330;
     +0.8852941176  +0.5000000000   0.0000000000   0.0000000000   -29.4117647059   0.0000000000;
      0.0000000000  -0.0558489738  +0.5000000000  -1.8554476330    0.0000000000   -0.1175209007];
+```
+
+**Current `Minv` literal (s1y=−0.267356, s2y=+0.269404, s1z/s2z=−0.054924/
+−0.054926, k=−0.022274) — matches `FoldrotorControlTest.cpp`'s
+`kSpecMinv` as of 2026-09-21.**
+
+```matlab
+% cond(M0) = 58.88 -> full rank, pinv == inv
+Minv = [ ...
+    +0.5018950707  +0.0084344507  +0.0001572486  -0.1535630527  +0.0000068943   +1.8502851798;
+    -1.2329396653  +0.5000003787  +0.0000000071  -0.0000068943  -22.4476968660  +0.0000830693;
+    -0.0001526860  +0.1016269135  +0.5018946920  -1.8502851798  +0.0000830693   -0.1535630531;
+    +0.4981049293  -0.0084344507  -0.0001572486  +0.1535630527  -0.0000068943   -1.8502851798;
+    +1.2329396653  +0.4999996213  -0.0000000071  +0.0000068943  +22.4476968660  -0.0000830693;
+    +0.0001526860  -0.1016269135  +0.4981053080  +1.8502851798  -0.0000830693   +0.1535630531];
 ```
 
 For the PX4 implementation, deriving the inverse from `M0` at
@@ -311,6 +372,69 @@ constructor and `Minv` is derived via `matrix::inv<float,6>()`, never
 hardcoded. The literal above now lives only in
 `FoldrotorControlTest.cpp` (`kSpecMinv`), as the reference the derived
 inverse is checked against (`DerivedInverseMatchesSpecLiteral`).
+
+## Pitch actuation path (decided 2026-09-21)
+
+Pitch has **no moment arm** on this airframe — both rotors sit at the
+same body x. `M0` row 4 therefore offers only two paths, and the
+controller must choose between them:
+
+```
+My_flu = kS1z*(T1x + T2x)  +  k*(T1y - T2y)
+         \__ tilt lever __/    \_ drag coupling _/
+           |kS1z| = 0.0549        |k| = 0.0223
+```
+
+**Contract:** the allocator is handed a wrench in which part of `Fx` may
+be a *pitch command* rather than a translation command. `allocate()` is
+unchanged and still solves the wrench exactly — this is a statement about
+how the caller composes the wrench, not about the algorithm (Scope: the
+custom allocator is not replaced, and its math is not rewritten).
+
+| | fold / alpha (drag path) | tilt / beta (lever path) |
+|---|---|---|
+| joint inertia (`model.sdf`) | 0.0136 kg*m^2 | **0.0012 kg*m^2** |
+| actuator, at `p=20, d=0.5` | 6.1 Hz, zeta 0.48 | **20.5 Hz, zeta 1.61** |
+| travel per 0.1 N*m, **pre-mast** | 16.3 deg | **6.8 deg** |
+| travel per 0.1 N*m, **post-mast** | **12.9 deg** | 16.7 deg |
+| lever arm `|kS1z|` | — | 0.0549 -> **0.0170** N*m/N |
+| body-x cost per 0.1 N*m | none | 1.8 N -> **5.9 N** |
+
+`FR_PITCH_LEVER` selects the split (0 = drag path only; 1 = lever only,
+which drives the differential fold command to exactly zero).
+
+**REVISED 2026-09-22, default 1.0 -> 0.0.** The contract above was written
+when the pitch axis was open-loop UNSTABLE at 2.77 Hz and needed ~8.3 Hz
+of loop bandwidth that the 6.1 Hz fold actuator could not supply at any
+gain. The ballast mast (findings.md (12)) moved the CoM below the rotor
+plane, so:
+
+- the axis is now **open-loop stable** (restoring 0.33 N*m/rad against
+  0.44 N*m of authority, a stable equilibrium over +-76 deg) and the
+  bandwidth argument that justified the lever no longer applies;
+- `kS1z` changed sign and the arm shortened 3.2x, so the lever costs
+  **more** travel than the path it replaced, plus 5.9 N of body-x force;
+- it can no longer extend the envelope at all — reaching the Fx-pinned
+  0.44 N*m ceiling would demand 25.9 N of body-x force.
+
+The mechanism is **kept, not removed**: it is correct for any geometry
+that puts the rotors far from the CoM, and this airframe may not keep its
+mast. Raise `FR_PITCH_LEVER` only with a measured reason.
+
+**Consequences for the envelope fit.** The lever share of `Fx` rides at
+*moment* priority, not horizontal-force priority — it is the pitch
+moment expressed on the other side of the lever arm. It is held through
+the horizontal-force step and scaled with the moment when the moment
+itself must yield. Sacrificing it first would silently delete the pitch
+command.
+
+**Not yet flown.** Nothing here has been flown since the 2026-09-22
+ballast mast. These figures are from `model.sdf` forward kinematics,
+the allocator's own forward map, and unit tests. The SITL open-loop and
+force/moment direction steps for the lever path have not been run. The
+`kS1z` z-offset they all rest on is verified against the SDF but **not**
+against a CoM-referenced force/torque measurement — the bench senses
+about the mount (findings.md (10), still open).
 
 ## Verification
 

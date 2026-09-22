@@ -12,21 +12,6 @@ The custom module replaces the full stack: position control → attitude
 control → rate/allocation → actuator output. Standalone PX4 module;
 existing PX4 controller/allocator modules are not modified.
 
-**Not yet true at runtime (confirmed 2026-09-07):** `4026_gz_foldrotor3`
-sources `rc.mc_defaults` (`VEHICLE_TYPE mc`), and `rc.vehicle_setup`
-unconditionally sources `rc.mc_apps` for any `mc` airframe — which starts
-`control_allocator`, `mc_rate_control`, `mc_att_control`, and
-`mc_pos_control`. Nothing currently stops this for this airframe, and
-`foldrotor_control` is not started by any rc script. This is harmless
-today only because `foldrotor_control` is a skeleton that publishes
-nothing. **The stock stack must stop being auto-started for this airframe
-at or before step 5 (the first actuator-publish test), not only at step
-6 (closed-loop hover)** — otherwise the moment `foldrotor_control` starts
-publishing `actuator_motors`/`actuator_servos`, both stacks will be
-commanding the same actuators simultaneously, and an open-loop
-actuator-publish test would be exercising a race, not the module in
-isolation.
-
 ## Architecture
 Estimator → Position Controller → Attitude Controller → Desired Wrench →
 Control Allocation → Actuator Commands → Gazebo
@@ -37,9 +22,24 @@ verified against the current codebase.
 
 | Boundary | In | Out | Units | Frame | Sign convention | Rate | Valid range | Stale-data behavior | Verified by |
 |---|---|---|---|---|---|---|---|---|---|
-| Estimator → Controller | EKF2 state | position, velocity, attitude, angular rate | m, m/s, rad, rad/s (assumed) | position: inertial/NED (confirmed); **velocity: inertial/NED, confirmed 2026-09-07 — same frame as position, per `VehicleLocalPosition.msg`'s `vx/vy/vz` doc (was OPEN)**; **attitude: quaternion on the wire, confirmed 2026-09-07 — `vehicle_attitude.q[4]`, Hamilton, FRD body→NED (per `VehicleAttitude.msg`), not Euler as previously stated; module must convert to Euler internally (ZYX, matching `Inertial2Body`) before the phi/theta/psi cascade math applies — see controller.md Interface**; **angular rate: FRD body, confirmed 2026-09-07 via `VehicleAngularVelocity.msg`** | TBD | pos 50Hz, att 250Hz, vel 50Hz, rate 1000Hz (per Simulink; unconfirmed in PX4 module) | TBD | TBD | interface test |
-| Controller → Allocation | state error | desired wrench: Fx_b,Fy_b,Fz_b,Mx_b,My_b,Mz_b | N, N·m | force components: **body required, currently inertial (confirmed bug — fix specified in controller.md)**; moment components: body (unaffected) | TBD | same as above | unconstrained (allocator saturates downstream) | n/a | comparison vs. Simulink |
-| Allocation → Actuators | desired wrench | F1,F2 (thrust), α1,β1,α2,β2 (tilt) | N; rad | body, per-rotor | **α1/α2 = Arm1FoldJoint/Arm2FoldJoint angle (lateral thrust tilt, body Y); β1/β2 = Arm1TiltJoint/Arm2TiltJoint angle (longitudinal thrust tilt, body X) — by design in vehicle dynamics, decided 2026-09-06. Arms are angle-sign-symmetric, not mirrored: equal positive α (or β) on both arms tilts both thrust vectors the same body direction. Detail: allocation.md "Actuator naming and tilt-limit convention".** | same as above | F: [0,15] N; **α,β: [-0.79, 0.79] rad (±45.26°) — decided 2026-09-06, clamped to the physical/SDF/servo range; was ±1.0472 rad (±60°), the allocator's original design intent, which the plant cannot reach. Detail: allocation.md.** | TBD | saturation test |
+| Estimator → Controller | EKF2 state | position, velocity, attitude, angular rate | m, m/s, rad, rad/s (assumed) | position: inertial (confirmed); attitude: Euler (confirmed representation); **velocity: OPEN — see controller.md Open questions** | TBD | pos 50Hz, att 250Hz, vel 50Hz, rate 1000Hz (per Simulink; unconfirmed in PX4 module) | TBD | TBD | interface test |
+| Controller → Allocation | state error | desired wrench: Fx_b,Fy_b,Fz_b,Mx_b,My_b,Mz_b | N, N·m | force components rotated inertial→body by Inertial2Body (4b), matching the Interface's requirement; moment components body-native. **Frame/sign convention of the wrench FoldrotorAllocation actually receives is UNRESOLVED — see below and FoldrotorAllocation.hpp OPEN ITEM (c).** | TBD | pos/vel 50Hz, attitude 250Hz, rate/allocation/publish 1000Hz (step 4e part 1/2 wiring; not from Simulink) | unconstrained (allocator saturates downstream) | n/a | interface tests (FoldrotorAllocationTest); comparison vs. Simulink still TBD |
+| Allocation → Actuators | desired wrench | F1,F2 (thrust), α1,β1,α2,β2 (tilt) | N; rad | body, per-rotor | **α1/α2 = Arm1FoldJoint/Arm2FoldJoint angle (lateral thrust tilt, body Y); β1/β2 = Arm1TiltJoint/Arm2TiltJoint angle (longitudinal thrust tilt, body X) — by design in vehicle dynamics, decided 2026-09-06. Arms are angle-sign-symmetric, not mirrored: equal positive α (or β) on both arms tilts both thrust vectors the same body direction. Detail: allocation.md "Actuator naming and tilt-limit convention".** | same as above | F: [0,15] N; **α,β: [-0.79, 0.79] rad (±45.26°) — decided 2026-09-06, clamped to the physical/SDF/servo range; was ±1.0472 rad (±60°), the allocator's original design intent, which the plant cannot reach. Detail: allocation.md.** | TBD | saturation test (FoldrotorAllocationTest.ThrustClampsAtFifteen / TiltClampsAt...), Minv·M0≈I and round-trip tests now exist |
+
+**Step 4e part 2 (this session): `FoldrotorAllocation` (allocation.md's
+Interface, `Minv` derived from `M0` at init) and the
+`actuator_motors`/`actuator_servos` publish now exist and are wired into
+`FoldrotorControl::Run()`.** Publishing is unconditional. **Publisher
+race resolved (2026-09-09, plan open item O-4):** `4026_gz_foldrotor3`
+no longer sets `VEHICLE_TYPE mc`, so the stock `control_allocator` (and
+`mc_pos_control`/`mc_att_control`/`mc_rate_control`) is no longer
+started for this airframe — `foldrotor_control` is now the sole
+publisher of `actuator_motors`/`actuator_servos`, not arbitrated between
+two. Fold (α) is pinned to 0 (no lateral thrust-vectoring authority
+yet). See `.claude/plans/step-4e-allocation-plan.md` open items
+O-2/O-5 and `FoldrotorAllocation.hpp`'s file-header OPEN ITEMS for what
+is still open. None of this has been exercised against Gazebo yet (Part D of that plan,
+not run this session).
 | Actuators → Gazebo | motors: `command/motor_speed` (idx 0,1); servos: `/model/foldrotor3_0/servo_0..3` (`SIM_GZ_SV_FUNC1..4`=201-204, confirmed set as of PR #3 — was the Milestone 1 blocker below) | applied force/moment | motors rad/s; servos rad (joint position) | **body FRD (X fwd, Y right, Z down) — note the SDF is authored in gz FLU, which is 180° about X from this. Lateral side-by-side rotor pair: Arm1/Prop1 at +Y (+0.2318/+0.2684 m), Arm2/Prop2 at −Y (−0.2348/−0.2684 m), props mirrored to ±0.26838, both at z=+0.0301. Set by `airframe_link_joint` = +90° roll (CAD Y-up → body up) then −90° yaw (arm heading). Verified 2026-09-05 from SDF+STL geometry, not assumption; guarded by `foldrotor3_tests/test_frame_convention.py`** | **Verified 2026-09-06 by force/moment direction test, all 6 channels (force_moment_test.md Results). Motors: a positive `-v` gives lift (−Fz FRD), Motor1 −Mx / +Mz and Motor2 +Mx / −Mz, so the counter-rotating pair cancels roll and yaw to <0.001 N·m while lift sums. Servos: a positive `-v` gives −My on Arm1Tilt and Arm2Tilt, −Mx on Arm1Fold, +Mx on Arm2Fold, each a pure moment with no net force. Combined motor+tilt redistributes thrust per cos/sin of the tilt angle. Signs all match the SDF-derived expectation; lift to 0.1%, roll 0.6%, yaw 0.2%. Required fixing the rotor thrust axis, which was perpendicular to the spin axis — guarded by `test_frame_convention.py`.** | TBD — 200 Hz was assumed; nothing in SDF or gz_bridge confirms it | motors: maxRotVelocity 2054.42 rad/s, `SIM_GZ_EC_MIN/MAX` corrected to 308/2054 (was mismatched 150/1000, fixed PR #3) so 100% throttle actually reaches maxRotVelocity; servo angle ±45.26° (±0.79 rad, matches model.sdf joint limit), `SIM_GZ_SV_MINA/MAXA` set accordingly | TBD | force/moment direction test |
 
 ## Verification philosophy

@@ -1,99 +1,86 @@
-# SITL Offboard hover recipe (foldrotor_control)
+# foldrotor_control SITL testing
 
-Manual launch recipe for exercising `foldrotor_control` end-to-end in Gazebo
-SITL over MAVLink Offboard, without going through
-`Tools/simulation/gz/simulation-gazebo`. Recorded because the sensor-plugin
-gap below cost real effort to diagnose.
+## Launching SITL
 
-## Why not `make px4_sitl_default gz_<model>` or the `simulation-gazebo` helper directly
+The generic `simulation-gazebo` helper (what `make px4_sitl_default
+gz_foldrotor3` would normally drive) uses a Gazebo server config that omits
+the sensor plugins this vehicle needs. Launch manually instead:
 
-Both work, but if you ever launch `gz sim` by hand (e.g. to attach a debugger
-to `px4` separately, or to inspect the server independently), the
-`simulation-gazebo` Python helper downloads a **generic** server config to
-`~/.simulation-gazebo/server.config`, which only loads `Physics`,
-`UserCommands`, and `SceneBroadcaster`. IMU/baro/mag never publish under that
-config — not because of rendering, and not because the world is paused, but
-because the `Imu`/`AirPressure`/`Magnetometer`/`Sensors` system plugins were
-never loaded. PX4's own launch path (`gz_env.sh.in`) sets
-`GZ_SIM_SERVER_CONFIG_PATH` to `src/modules/simulation/gz_bridge/server.config`,
-which declares all of them. Any hand launch of `gz sim` must set that same
-variable explicitly.
-
-## 1. Launch the Gazebo server
-
-```bash
-REPO=/home/magesvarlinux/PX4-Autopilot
-export GZ_SIM_SERVER_CONFIG_PATH="$REPO/src/modules/simulation/gz_bridge/server.config"
-export GZ_SIM_RESOURCE_PATH="$REPO/Tools/simulation/gz/models:$REPO/Tools/simulation/gz/worlds:$GZ_SIM_RESOURCE_PATH"
-cd "$REPO"
-gz sim -s -r -v 3 "$REPO/Tools/simulation/gz/worlds/default.sdf"
 ```
-
-`-r` starts the world running (not paused) immediately; without it the
-server sits paused until something unpauses it. Confirm sensors are actually
-flowing, not just the clock:
-
-```bash
-gz topic -e -t /clock -n 2                                   # sim time ticking
-gz topic -e -t /world/default/model/<model>/link/<link>/sensor/imu_sensor/imu -n 1
-```
-
-## 2. Launch PX4 SITL against it
-
-Use `gz_foldrotor3` for free flight (the vehicle can fall) or
-`gz_foldrotor3_bench` for a rig-mounted test where altitude/vz cannot be
-trusted as a controller signal — the bench rig holds the vehicle up
-regardless of what the controller commands.
-
-```bash
+GZ_SIM_SERVER_CONFIG_PATH=<path-to-px4-gz-bridge-server.config> \
 PX4_SYS_AUTOSTART=4026 \
 PX4_SIM_MODEL=gz_foldrotor3 \
-PX4_GZ_WORLD=default \
-GZ_IP=127.0.0.1 \
-HEADLESS=1 \
-./build/px4_sitl_foldrotor/bin/px4
+./build/px4_sitl_default/bin/px4
 ```
 
-(Feed stdin via a named FIFO + a `sleep infinity` holder if driving the pxh
-shell non-interactively; recreate both the FIFO and the holder together, or a
-new launch can end up writing to an orphaned FIFO with no reader.)
+Bring up Gazebo (`gz sim`) separately, pointed at the foldrotor world, before
+or after starting `px4`.
 
-At the pxh prompt, disable the RC-loss and data-link-loss failsafes for a
-headless run with no RC and only a MAVLink offboard link (there is a
-`NAV_DLL_ACT` default in the airframe file already, but Offboard testing
-with no telemetry heartbeat guarantees needs both off):
+## Watching position/orientation/commanded allocation live
+
+`plot_hover.py` is a passive MAVLink listener -- it does not arm, switch
+modes, or send setpoints. Run it in a second terminal any time after SITL is
+up, while you fly/hold hover however you normally do (QGC, RC, an offboard
+script):
 
 ```
-param set NAV_DLL_ACT 0
-param set NAV_RCL_ACT 0
+python3 src/modules/foldrotor_control/sitl_testing/plot_hover.py
 ```
 
-## 3. Drive an Offboard hover
+It buffers `LOCAL_POSITION_NED`, `ATTITUDE`, and the module's own
+`DEBUG_FLOAT_ARRAY` allocation output in memory. When it stops receiving
+data -- either because you Ctrl+C this script directly, or because you
+Ctrl+C the `px4` process in its own terminal -- it opens a matplotlib window
+with four stacked plots, sharing a time axis:
 
-```bash
-python3 src/modules/foldrotor_control/sitl_testing/offboard_hover.py \
-    --altitude 2.0 --hold-seconds 60 --log /tmp/hover_log.csv
+- position (x/y/z, meters, NED)
+- orientation (roll/pitch/yaw, degrees)
+- commanded force per rotor (F1/F2, newtons), with dashed reference lines
+  at the `[0, 15] N` actuator limit
+- commanded servo angles per rotor (alpha = fold, beta = tilt, degrees),
+  with dashed reference lines at the `+-45.3 deg` tilt limit -- and, when
+  available, the faint overlaid ACTUAL joint angle (see next section)
+
+Any time window where `FoldrotorAllocation`'s `saturated` flag was set (a
+channel got clamped to its limit) is shaded on the force/angle plots.
+
+The commanded values come from `FoldrotorControl::Run()` publishing
+`debug_array_s` (name `fr_alloc`, see `FoldrotorControl.hpp`/`.cpp`) --
+a generic, already-registered MAVLink stream
+(`MavlinkStreamDebugFloatArray` -> `DEBUG_FLOAT_ARRAY`). No PX4 core module,
+mavlink included, needed a source change to get this data out.
+
+This is a live/interactive alternative to pulling the position/orientation
+signals out of the `.ulg` PX4's own logger already records (the commanded
+force/servo angles are not currently in the `.ulg` -- only surfaced via this
+debug stream and `foldrotor_control status`); it doesn't replace the log.
+
+## Actual (not just commanded) servo angle
+
+Fold/tilt joints are driven by a bounded-effort PID
+(`gz-sim-joint-position-controller-system`, `Tools/simulation/gz/models/
+foldrotor3/model.sdf`), not an infinitely stiff joint -- under enough
+external (rotor-thrust reaction) torque the real simulated angle can lag or
+sit away from the commanded one. `foldrotor3/model.sdf` also carries a
+`gz-sim-joint-state-publisher-system` plugin (same one the
+`foldrotor3_bench` rig already used for this, see `open_loop_commands.md`)
+publishing true joint position/velocity as a `gz.msgs.Model` on
+`/world/<world>/model/<model instance>/joint_state`.
+
+`plot_hover.py` subscribes to this directly via `gz-transport13`'s Python
+bindings (`gz.transport13`, `gz.msgs.model_pb2.Model` -- both need to be
+importable; confirm with `python3 -c "import gz.transport13, gz.msgs"`) and
+overlays the actual alpha1/alpha2/beta1/beta2 onto the same angle subplot as
+the commanded traces, sharing this script's own timeline so the two line up
+even at the ~1-2 Hz timescale a bang-banging oscillation shows up at.
+
+The default `--gz-topic` guesses the model instance name
+(`foldrotor3_0`) -- confirm the live one first:
+
+```
+gz topic -l | grep joint_state
+python3 src/modules/foldrotor_control/sitl_testing/plot_hover.py --gz-topic /world/default/model/<name>/joint_state
 ```
 
-This streams `SET_POSITION_TARGET_LOCAL_NED` (position-only type mask) for
-2s, requests `OFFBOARD` (PX4 custom main mode 6), arms, then keeps streaming
-for `--hold-seconds`. The setpoint stream must not stop before or during the
-mode switch and arm, or PX4 will refuse/exit Offboard on timeout.
-
-Useful live signals while it runs, from the pxh shell or `listener`:
-
-- `foldrotor_control`'s own periodic log line: `armed=`, `offboard=`,
-  `position_ctrl=`, `F_b=[...]N`, `M_b=[...]`
-- `listener vehicle_local_position` — `z`, `vz`, drift in `x`/`y`
-- `listener vehicle_attitude` — roll/pitch for divergence/oscillation
-
-Note `vehicle_attitude_setpoint` is **not** published by this module (it
-computes/consumes attitude error internally without republishing to the
-standard topic), so it is not available as a thrust/attitude-setpoint signal
-source.
-
-## 4. Clean up
-
-Kill the `gz sim` server, the `px4` process, and any FIFO-holder `sleep
-infinity` process explicitly by PID — `pkill -f "gz sim"` pattern matches can
-miss the actual process depending on how it was invoked.
+Pass `--gz-topic ''` to fall back to commanded-only plotting (e.g. if the
+SDF plugin isn't loaded, or you're deliberately isolating from Gazebo).
