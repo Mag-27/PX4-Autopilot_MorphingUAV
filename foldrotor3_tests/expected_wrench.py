@@ -145,8 +145,23 @@ def motor_wrench(frames, root, motors, motor_index, value, angles):
     """Thrust, its moment about the mount origin, and rotor drag torque."""
     m = motors[motor_index]
     omega = MOTOR_OMEGA_MIN + value * (MOTOR_OMEGA_MAX - MOTOR_OMEGA_MIN)
-    magnitude = m["kf"] * omega ** 2
+    force, torque = rotor_wrench(frames, root, motors, motor_index,
+                                 m["kf"] * omega ** 2, angles)
+    return force, torque, omega
 
+
+def rotor_wrench(frames, root, motors, motor_index, magnitude, angles):
+    """Thrust of a given MAGNITUDE (N), its moment about the mount origin,
+    and rotor drag torque -- motor_wrench() without the omega mapping.
+
+    Split out 2026-09-25 so the CoM-referenced moment analysis can drive
+    the model with FoldrotorAllocation's per-rotor thrust directly. The
+    thrust point is the rotor LINK's CoM, which is where gz applies it --
+    and, measured against the prop mesh, sits inside the blade band
+    (+4.6..+7.4 mm above the joint, CoM +5.74 mm), so it is also the real
+    vehicle's thrust point to within 0.3 mm. See findings.md (21).
+    """
+    m = motors[motor_index]
     t = transform_with_angles(frames, root, m["link"], angles)
     rotation = t[:3, :3]
 
@@ -156,7 +171,7 @@ def motor_wrench(frames, root, motors, motor_index, value, angles):
     # AddWorldForce with no offset applies the force at the link's CoM.
     _, com = _inertials(root)[m["link"]]
     r = rotation @ com + t[:3, 3]
-    return force, np.cross(r, force) + drag, omega
+    return force, np.cross(r, force) + drag
 
 
 def case(frames, root, motors, inertials, active_motors, angles):

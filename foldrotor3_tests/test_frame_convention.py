@@ -186,6 +186,103 @@ def test_bench_airframe_orientation_matches_flight():
         f"flight=\n{flight_r}\nbench=\n{bench_r}")
 
 
+
+# The bench fixture's own additions. Everything else in the bench file must
+# be the flight vehicle, exactly.
+BENCH_ONLY_LINKS = {"mount_plate"}
+BENCH_ONLY_JOINTS = {"bench_anchor_joint", "bench_mount_joint"}
+
+
+def _floats(text):
+    return tuple(float(v) for v in (text or "").split())
+
+
+def _inertial_of(link):
+    inertial = link.find("inertial")
+    if inertial is None:
+        return None
+    inertia = inertial.find("inertia")
+    pose = inertial.find("pose")
+    return {
+        "mass": float(inertial.findtext("mass")),
+        "inertia": tuple(float(inertia.findtext(k) or 0.0) if inertia is not None else 0.0
+                         for k in ("ixx", "ixy", "ixz", "iyy", "iyz", "izz")),
+        "pose": (None, ()) if pose is None else (pose.get("relative_to"), _floats(pose.text)),
+    }
+
+
+def _link_physics(root):
+    out = {}
+    for link in root.findall("link"):
+        pose = link.find("pose")
+        out[link.get("name")] = {
+            "pose": (None, ()) if pose is None else (pose.get("relative_to"), _floats(pose.text)),
+            "inertial": _inertial_of(link),
+        }
+    return out
+
+
+def _joint_physics(root):
+    out = {}
+    for joint in root.findall("joint"):
+        pose = joint.find("pose")
+        out[joint.get("name")] = {
+            "type": joint.get("type"),
+            "parent": joint.findtext("parent"),
+            "child": joint.findtext("child"),
+            "pose": (None, ()) if pose is None else (pose.get("relative_to"), _floats(pose.text)),
+            "axis": _floats(joint.findtext("axis/xyz")),
+        }
+    return out
+
+
+def test_bench_vehicle_is_physically_identical_to_flight():
+    """Every flight link and joint must exist in the bench with identical physics.
+
+    test_bench_airframe_orientation_matches_flight above guards ONE pose. It
+    did not catch the 2026-09-22 ballast mast (commit 2835862), which added
+    a 0.443 kg link 0.3 m below base_link to the flight model only: the bench
+    kept measuring a 1.557 kg vehicle with its CoM 7.2 cm higher and the
+    rotor-to-CoM offset kS1z of the OPPOSITE sign. Every force/moment result
+    taken on the bench after that date described the wrong airframe, and
+    the pitch lever -- the quantity that sign change exists for -- is exactly
+    what a mount-referenced bench reading is most sensitive to.
+
+    This compares masses, inertia tensors, inertial and link poses, and joint
+    type/parent/child/pose/axis for the whole vehicle, allowing only the
+    fixture's own additions. See findings.md 2026-09-25 (20).
+    """
+    flight_root, _ = _frames_of(MODEL_SDFS["flight"])
+    bench_root, _ = _frames_of(MODEL_SDFS["bench"])
+
+    flight_links, bench_links = _link_physics(flight_root), _link_physics(bench_root)
+    flight_joints, bench_joints = _joint_physics(flight_root), _joint_physics(bench_root)
+
+    missing_links = sorted(set(flight_links) - set(bench_links))
+    missing_joints = sorted(set(flight_joints) - set(bench_joints))
+    assert not missing_links and not missing_joints, (
+        f"bench is missing flight-model links {missing_links} and joints {missing_joints}")
+
+    extra_links = sorted(set(bench_links) - set(flight_links) - BENCH_ONLY_LINKS)
+    extra_joints = sorted(set(bench_joints) - set(flight_joints) - BENCH_ONLY_JOINTS)
+    assert not extra_links and not extra_joints, (
+        f"bench has vehicle links {extra_links} / joints {extra_joints} the flight model lacks")
+
+    for name, physics in flight_links.items():
+        assert bench_links[name] == physics, (
+            f"link {name} physics drifted:\n flight={physics}\n bench ={bench_links[name]}")
+
+    for name, physics in flight_joints.items():
+        assert bench_joints[name] == physics, (
+            f"joint {name} drifted:\n flight={physics}\n bench ={bench_joints[name]}")
+
+    def vehicle_mass(links, fixture):
+        return sum(v["inertial"]["mass"] for k, v in links.items()
+                   if v["inertial"] is not None and k not in fixture)
+
+    assert vehicle_mass(bench_links, BENCH_ONLY_LINKS) == pytest.approx(
+        vehicle_mass(flight_links, set()), abs=1e-9)
+
 ROTORS = [("Prop1Link", "Prop1Joint"), ("Prop2Link", "Prop2Joint")]
 
 

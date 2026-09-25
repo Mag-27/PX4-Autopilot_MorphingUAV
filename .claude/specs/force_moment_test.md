@@ -17,6 +17,30 @@ closed-loop validation is attempted.
 
 ## Status
 
+> **STALE AS OF 2026-09-22; bench updated 2026-09-25, re-run NOT yet done.**
+> The results below were measured on the PRE-mast vehicle (1.557 kg, rotors
+> 5.5 cm below the CoM). Commit `2835862` added the ballast mast to the
+> flight `model.sdf` only, so the bench kept that airframe until
+> 2026-09-25, when the mast was copied into
+> `foldrotor3_bench/model.sdf` verbatim. The bench now weighs 2.000 kg
+> (`expected_wrench.py` baseline Fz = -19.601 N, was ~-15.26) and `kS1z`
+> has the opposite sign, so every expected pitch-axis value below is
+> superseded. Guards added: `test_bench_vehicle_is_physically_identical_to_flight`
+> (full link/joint physics parity, which would have caught this) and a
+> clearance check that now bounds primitive cylinders and pins the disc as
+> the lowest point (0.19 m above ground).
+>
+> **CoM-referenced Phase 0 (offline) done 2026-09-25**, `findings.md` (21):
+> `foldrotor3_tests/com_moment_analysis.py` + `test_com_moment.py`. The
+> allocator's pitch MOMENT path passes the CoM criterion; its FORCE path
+> leaks ~0.06 N*m of pitch per newton of body-x force (known defect,
+> xfail-strict). Phase 1 (bench confirmation) not yet run.
+>
+> Still true after a re-run: this test senses about the MOUNT. The
+> CoM-referenced pitch test named as the main gap in `findings.md` (12)
+> and (20) needs the mount wrench transformed to the CoM
+> (`M_com = M_mount - r_com x F`), or the sensor moved there.
+
 **Complete, 2026-09-06. PASSED — all 6 actuator channels plus both combined
 cases verified against an SDF-derived expectation.** Every sign is correct;
 lift matches to 0.1%, roll 0.6%, yaw 0.2%.

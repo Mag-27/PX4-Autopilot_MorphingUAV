@@ -109,12 +109,12 @@ constraint.
 | `FR_VEL_Z_FF` | Velocity (Z) | **P gain on the velocity error** (see note) | 7.0 | Name says FF; meaning is P — decided 2026-09-07 |
 | `FR_VEL_Z_I` | Velocity (Z) | Integral gain | 7.0 | |
 | `FR_VEL_Z_D` | Velocity (Z) | Derivative gain | 0.1 | **Now 0.0 (2026-09-22).** Synthetic mass, not damping — see "Derivative gains zeroed" below. Its input, `vehicle_local_position.az`, carried 19.6 m/s² rms of airframe vibration, which this gain turned into 1.96 N rms of the 2.82 N rms commanded `Fz` |
-| `FR_VEL_Z_GRAV_FF` | Velocity (Z) | Gravity feedforward | 15.260017 | **Resolved 2026-09-09** (was 9.81, the raw acceleration literal — see open item below): force-domain feedforward must equal the vehicle's measured weight in newtons, per `controller.md` Open questions 3/4. The Z loop's extra summing junction question is separate and still open, not represented as a param here since it's a control-law structure question (step 4), not a gain value |
-| `FR_VEL_Z_I_LIM` | Velocity (Z) | Integrator windup limit (N) | 3.0 | **New 2026-09-09**, resolving the "no `FR_VEL_*_I_LIM` param" gap on this axis (see `AttitudeRateControl`'s analogous, still-unfilled `FR_RATE_*_I_LIM` gap below): bounds `FR_VEL_Z_I`'s accumulated integral directly via `PositionVelocityControl::setIntegratorLimit()`, separate from the still-inert output-limit/conditional-integration anti-windup. Chosen post-`FR_VEL_Z_GRAV_FF` fix: the integrator only needs to cover real trim/disturbance now, not a structural feedforward gap. No X/Y equivalent — not decided |
+| `FR_VEL_Z_GRAV_FF` | Velocity (Z) | Gravity feedforward | **19.6014 (2026-09-22)**, was 15.260017 | **Resolved 2026-09-09** (was 9.81, the raw acceleration literal — see open item below): force-domain feedforward must equal the vehicle's measured weight in newtons, per `controller.md` Open questions 3/4. **Re-scaled 2026-09-22** for the ballast mast — the 15.260017 value was a 1.5571 kg vehicle and the mast added 0.443 kg, leaving a 4.341 N gap the 3.0 N integrator limit could not cover; see "Gravity feedforward re-scaled" below. The Z loop's extra summing junction question is separate and still open, not represented as a param here since it's a control-law structure question (step 4), not a gain value |
+| `FR_VEL_Z_I_LIM` | Velocity (Z) | Integrator windup limit (N) | 3.0 | **New 2026-09-09**, resolving the "no `FR_VEL_*_I_LIM` param" gap on this axis (see `AttitudeRateControl`'s analogous, still-unfilled `FR_RATE_*_I_LIM` gap below): bounds `FR_VEL_Z_I`'s accumulated integral directly via `PositionVelocityControl::setIntegratorLimit()`, separate from the still-inert output-limit/conditional-integration anti-windup. Chosen post-`FR_VEL_Z_GRAV_FF` fix: the integrator only needs to cover real trim/disturbance now, not a structural feedforward gap. **That premise is a precondition, not commentary** — it stopped holding when the 2026-09-22 ballast mast landed, and `GravityFeedforwardResidualFitsIntegrator` now guards it. No X/Y equivalent — not decided |
 | `FR_VEL_XY_MAX` | Velocity (X/Y) | Max horizontal velocity setpoint (m/s) | 1.0 | **New 2026-09-17**, resolving `PositionVelocityControl.hpp` OPEN ITEM (b): clamps the position loop's `vel_sp` before the velocity PID (`mc_pos_control`'s `setVelocityLimits()`/`constrainXY()` equivalent). Added after real SITL testing showed an unlimited `vel_sp` from an ordinary position step could by itself approach the combined force-magnitude sphere (`FR_VEL_*` gains × unlimited velocity error), starving the allocator of per-rotor thrust headroom and forcing fold/tilt to their rails within milliseconds of arming — see `findings.md`'s 2026-09-17 entry. First-cut placeholder, **not yet verified against a logged step response** |
 | `FR_VEL_Z_MAX_UP` | Velocity (Z) | Max climb velocity setpoint (m/s) | 1.0 | **New 2026-09-17**, same motivation/status as `FR_VEL_XY_MAX` |
 | `FR_VEL_Z_MAX_DN` | Velocity (Z) | Max descent velocity setpoint (m/s) | 0.7 | **New 2026-09-17**, same motivation/status as `FR_VEL_XY_MAX`. Deliberately lower than `FR_VEL_Z_MAX_UP`, mirroring `mc_pos_control`'s `MPC_Z_VEL_MAX_DN < MPC_Z_VEL_MAX_UP` convention |
-| `FR_ATT_P` | Attitude | P gain, all axes (phi,theta,psi) | 3.0 | Shared across axes, per Simulink |
+| `FR_ATT_P` | Attitude | P gain, all axes (phi,theta,psi) | **4.0** | Shared across axes. **This row said 3.0 while the module shipped 2.0** — a stale entry, corrected 2026-09-23 when the value was raised to 4.0 for attitude-command bandwidth. 4.0 is a deliberate departure from Simulink's Kp = 3; the ceiling is 5.09, set by pitch, see `findings.md` (18) |
 | `FR_PITCH_LEVER` | Attitude | Fraction of pitch moment routed through the body-x tilt lever | **0.0** | **Not from Simulink** — added 2026-09-21, defaulted OFF 2026-09-22 once the ballast mast made pitch open-loop stable and shortened the lever arm 3.2x. 0 = drag path only, 1 = lever only. See allocation.md "Pitch actuation path" and findings.md (11), (12). |
 | `FR_RATE_R_FF` | Rate (roll, Mx_b) | **P gain on the rate error** (see note) | 3.5 | Name says FF; meaning is P — decided 2026-09-07. Was `FR_RATE_RP_FF`, split 2026-09-21 |
 | `FR_RATE_R_I` | Rate (roll) | Integral gain | 0.1 | Was `FR_RATE_RP_I` |
@@ -221,6 +221,68 @@ steady-state trim changes. The pitch lever is derived from the *filtered*
 moment so that `fitWrenchToEnvelope()`'s `fx_lever_flu` matches the `Fx`
 actually inside the commanded force.
 
+## Gravity feedforward re-scaled (2026-09-22)
+
+`FR_VEL_Z_GRAV_FF` 15.260017 → **19.6014 N**.
+
+The old value was the 2026-09-09 Part D bench measurement of a 1.5571 kg
+vehicle (1.5571 × 9.8 = 15.2596 N). The ballast mast (`model.sdf`
+`ballast_link`) added 0.443 kg earlier the same day and this parameter was
+not re-measured with it, while the rest of the module was already updated
+(`FoldrotorControl.hpp` and the allocation tests moved to 19.615 N).
+
+### The contract that was violated
+
+The feedforward does not have to be exact — the integrator trims the
+remainder. But the remainder must be something the integrator is *allowed*
+to supply, and `FR_VEL_Z_I_LIM` is a hard symmetric clamp in newtons:
+
+```
+residual = |weight − grav_ff| = 19.6014 − 15.260017 = 4.341 N
+FR_VEL_Z_I_LIM                                      = 3.000 N
+unsuppliable                                        = 1.341 N
+```
+
+The 1.341 N can only come from `FR_VEL_Z_FF × e_v`, which requires a
+permanent velocity error, which through `FR_POS_P` requires a permanent
+position error:
+
+```
+1.341 / FR_VEL_Z_FF (7.0) / FR_POS_P (0.4) = 0.479 m
+```
+
+| | predicted | measured (log 2026-09-22/06_38_09.ulg) |
+|---|---|---|
+| steady-state altitude error | 0.479 m | 0.468 m (cmd −1.50, held −1.03, EKF frame) |
+| Z integrator | pinned at limit | −3.0001 N over 5778 samples, range ±0.006 N |
+| actuator saturation | none expected | 0.0%, motors at 0.59 |
+
+Nothing saturates and nothing warns. The vehicle simply holds the wrong
+altitude — which is why this needed a guard rather than a comment.
+
+### Verification criterion
+
+`FoldrotorControlParamTest.GravityFeedforwardResidualFitsIntegrator`
+asserts `|weight − FR_VEL_Z_GRAV_FF| < FR_VEL_Z_I_LIM`, two-sided, and
+that the implied steady-state altitude error is zero. Confirmed to fail
+on the old value, reporting 0.47907 m.
+
+### Provenance change, stated explicitly
+
+This parameter's description previously *required* a bench measurement
+("a direct measurement, not a computed mass estimate"). The new value is
+computed: `model.sdf`'s nine link masses sum to 2.000145 kg,
+`worlds/foldrotor.sdf` sets gravity to exactly −9.8, so the weight is
+19.6014 N. In SITL the SDF inertial block is the ground truth and a bench
+run only re-measures it, so computing is the more accurate of the two.
+**That reasoning does not carry to hardware** — re-measure before any real
+flight, where 9.80665 also replaces the world's 9.8.
+
+Related: the module elsewhere rounds hover thrust to 19.615 N using
+standard g. The 0.014 N (0.07%) difference is absorbed by the integrator
+and is not worth a second constant, but it is why the two are not
+bit-identical.
+
 ## Implementation pattern
 Per `reference/px4-module-patterns.md` item 4 (confirmed convention across
 `mc_pos_control`/`mc_att_control`/`mc_rate_control`):
@@ -281,6 +343,29 @@ These are restated from `controller.md`, not decided here:
    velocity PID, mirroring `mc_pos_control`'s `setVelocityLimits()`. Values
    are first-cut placeholders, **not yet verified against a logged step
    response** — same open-item status as the force-sphere constants above.
+
+   **Combined force sphere re-expressed as T/W (2026-09-23, user
+   decision).** `kPosVelForceLimit` is no longer a 28 N literal but
+   `kPosVelForceTW * FR_VEL_Z_GRAV_FF` = 2 × 19.6014 = **39.20 N**.
+   Deriving it from the weight param rather than hardcoding newtons is
+   deliberate: it is the same failure mode that cost 0.47 m of altitude
+   when the pre-mast 15.26 N weight literal survived the ballast mast
+   (`findings.md` 2026-09-22 (14)). A non-positive weight falls back to
+   the rotor ceiling, `2 * kMaxThrust`.
+
+   **This changes what the sphere is for, and the change is a loss.** At
+   28 N it sat under the airframe's 30 N rotor ceiling and so prevented
+   the position loop from commanding force that does not exist — with the
+   8 N margin, commanded `Fz` was capped at 26.8 N. At 39.20 N that cap
+   is 38.4 N, 8.4 N above the ceiling, so the sphere no longer bounds the
+   command to anything deliverable; `fitWrenchToEnvelope()` and the
+   allocator's per-rotor clamp do, and the allocator's `saturated` flag
+   is known to read 0% while a joint sits on its rail
+   (`findings.md` 2026-09-22 (12)). The airframe's real T/W is 1.53
+   (30 N / 19.60 N); T/W = 2 is not reachable without `model.sdf`
+   changes. Full numbers in `findings.md` 2026-09-23 (15). Pinned by
+   `CombinedForceSphereIsTwoTimesWeightAndExceedsRotorCeiling`; **not yet
+   flown**.
 2. **Yaw rate loop zero I/D gain.** Step 4c implemented these as given
    and invented nothing; combined with the FF-as-P decision, yaw is now
    a pure proportional law, guarded by a regression test that asserts

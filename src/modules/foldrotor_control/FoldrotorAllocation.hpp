@@ -251,7 +251,60 @@ public:
 		return out;
 	}
 
+	/**
+	 * Forward map: per-rotor commands -> the wrench they actually produce,
+	 * body FLU. The inverse direction of allocate(), and the measurement
+	 * half of PX4's allocator-feedback anti-windup -- ControlAllocator.cpp:
+	 * 648-657 computes exactly this residual as
+	 * `getControlSetpoint() - getAllocatedControl()`.
+	 *
+	 * WHY IT IS NEEDED HERE. allocate() clamps per rotor and does not
+	 * redistribute (see allocateRotor()), so its Output is in general NOT
+	 * the wrench that was asked for. Running the forward map on the
+	 * CLAMPED Output is the only way to know what the actuators will
+	 * deliver. The `saturated` flag is not a substitute: it says only that
+	 * something clipped, and findings.md 2026-09-22 (12) measured it
+	 * reading 0.0% while beta1 sat pinned to its -45.3 deg rail through an
+	 * entire departure.
+	 *
+	 * Uses the same per-rotor forward expressions allocateRotor() inverts,
+	 * stacked and multiplied by M0 -- w = M0 * T, the transpose journey of
+	 * allocate()'s T = Minv * w. No new algorithm, and allocate() itself is
+	 * untouched (.claude/CLAUDE.md rule 7).
+	 *
+	 * @param out    a previous allocate() result, clamps included
+	 * @param F_flu  delivered force,  body FLU (N)
+	 * @param M_flu  delivered moment, body FLU (N*m)
+	 */
+	void deliveredWrench(const Output &out, matrix::Vector3f &F_flu, matrix::Vector3f &M_flu) const
+	{
+		matrix::Vector<float, 6> T;
+		rotorThrustVector(out.F1, out.alpha1, out.beta1, T(0), T(1), T(2));
+		rotorThrustVector(out.F2, out.alpha2, out.beta2, T(3), T(4), T(5));
+
+		const matrix::Vector<float, 6> w = _M0 * T;
+
+		F_flu = matrix::Vector3f(w(0), w(1), w(2));
+		M_flu = matrix::Vector3f(w(3), w(4), w(5));
+	}
+
 private:
+	/**
+	 * allocation.md's forward map for ONE rotor, the expression
+	 * allocateRotor() inverts:
+	 *     Tx = F*sin(beta)
+	 *     Ty = -F*cos(beta)*sin(alpha)
+	 *     Tz = F*cos(beta)*cos(alpha)
+	 * Factored out so deliveredWrench() and the inverse cannot drift apart.
+	 */
+	static void rotorThrustVector(float F, float alpha, float beta, float &Tx, float &Ty, float &Tz)
+	{
+		const float cos_beta = cosf(beta);
+		Tx = F * sinf(beta);
+		Ty = -F * cos_beta * sinf(alpha);
+		Tz = F * cos_beta * cosf(alpha);
+	}
+
 	// allocation.md "Actuator geometry / effectiveness matrix": rotor
 	// geometry constants, matching the SDF-verified rotor positions
 	// (RESOLVED 2026-09-09 -- see OPEN ITEM (b) and decision 4 above;

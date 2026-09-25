@@ -59,19 +59,53 @@ parameters:
     FR_VEL_Z_GRAV_FF:
       description:
         short: Velocity Z gravity feedforward
-        long: >-
+        long: |
           Force-domain gravity feedforward on the Z velocity loop, the
           vehicle's own weight in newtons, not the raw 9.81 m/s^2
           acceleration literal. controller.md's translational dynamics
           equation (p_ddot = R*F_b/m - [0,0,g]) requires the Fz feedforward
-          to equal mg for a level hover, not m*0 + g. Value is the
-          2026-09-09 Part D bench-measured static weight
-          (findings.md, "(4)" entry), a direct measurement, not a
-          computed mass estimate. Resolves controller.md's Open questions
-          3 and 4 (2026-09-09) as under-scaled, not a units/sign swap; see
-          that section for the derivation.
+          to equal mg for a level hover, not m*0 + g. Resolves
+          controller.md's Open questions 3 and 4 (2026-09-09) as
+          under-scaled, not a units/sign swap.
+
+          REVISED 2026-09-22, 15.260017 -> 19.6014, for the ballast mast.
+          The old value was the 2026-09-09 Part D bench measurement of a
+          1.5571 kg vehicle (1.5571 * 9.8 = 15.2596 N). model.sdf's
+          `ballast_link` added 0.443 kg the same day the mast landed, and
+          this param was not re-measured with it.
+
+          WHY IT MATTERED. The integrator has to make up whatever the
+          feedforward misses, and FR_VEL_Z_I_LIM bounds it at 3.0 N. The
+          gap was 19.6014 - 15.260017 = 4.341 N, so 1.341 N could not be
+          supplied by the integrator at all and had to come from
+          FR_VEL_Z_FF * e_v instead. That forces a PERMANENT velocity
+          error of 1.341 / 7.0 = 0.1916 m/s and, through FR_POS_P, a
+          permanent altitude error of 0.1916 / 0.4 = 0.479 m. Measured in
+          log 2026-09-22/06_38_09.ulg: commanded -1.50 m, held -1.03 m
+          (EKF frame), a 0.468 m sag, with the Z integrator pinned at
+          -3.0001 N across 5778 samples and NO actuator saturation
+          anywhere (motors at 0.59). See findings.md 2026-09-22 (14).
+
+          PROVENANCE CHANGED, deliberately. The old value was a bench
+          measurement, which this description used to require ("a direct
+          measurement, not a computed mass estimate"). The new value is
+          computed: model.sdf's nine link masses sum to 2.000145 kg and
+          worlds/foldrotor.sdf sets gravity to exactly -9.8, so
+          2.000145 * 9.8 = 19.6014 N. In SITL the SDF inertial block IS
+          the ground truth and a bench measurement only re-measures it,
+          so computing is the more accurate of the two here. That
+          reasoning does NOT carry to hardware: re-measure before any
+          flight on the real airframe, where 9.80665 also replaces the
+          world's 9.8.
+
+          Note the rest of the module rounds hover thrust to 19.615 N
+          (FoldrotorControl.hpp, the allocation tests), which uses
+          standard g = 9.80665 rather than the world's 9.8. The 0.014 N
+          difference is 0.07% and the integrator absorbs it; it is not
+          worth a second constant, but it is why this value and that one
+          are not bit-identical.
       type: float
-      default: 15.260017
+      default: 19.6014
     FR_VEL_Z_I_LIM:
       description:
         short: Velocity Z integrator windup limit
@@ -87,6 +121,14 @@ parameters:
           well below the hover weight rather than left unbounded. No
           equivalent param exists for X/Y; that is an open decision, not
           an oversight.
+
+          That premise -- "no structural feedforward gap" -- is a real
+          precondition, not commentary, and it silently stopped holding
+          between 2026-09-22's ballast mast and the FR_VEL_Z_GRAV_FF fix
+          later the same day: the gap was 4.341 N against this 3.0 N
+          bound, and the 1.341 N remainder showed up as a permanent
+          0.47 m altitude sag. GravityFeedforwardResidualFitsIntegrator
+          now guards it.
       type: float
       default: 3.0
     FR_VEL_XY_I_LIM:
@@ -159,10 +201,59 @@ parameters:
     FR_ATT_P:
       description:
         short: Attitude P gain
-        long: Attitude proportional gain, all axes (phi,theta,psi) share this
-          value, per the Simulink reference model.
+        long: |
+          Attitude proportional gain, all axes (phi,theta,psi) share this
+          value, per the Simulink reference model. rate_sp = FR_ATT_P *
+          euler_error, so it sets the closed-loop attitude bandwidth.
+
+          RAISED 2.0 -> 4.0, 2026-09-23 (user decision), after the first
+          commanded-attitude flight. A 5 deg one-shot command reached only
+          2.8 deg roll / 1.5 deg pitch inside the module's 500 ms setpoint
+          window, because at 2.0 the rate setpoint for a 5 deg error is
+          10 deg/s and 500 ms of it barely covers the commanded angle even
+          with perfect rate tracking.
+
+          Cascade simulation against the measured inertias (Ixx 0.10247,
+          Iyy 0.04108), the shipped rate gains, FR_WRENCH_LP and the
+          measured hover authority, stepping 5 deg:
+
+            FR_ATT_P   roll @500ms  t90     pitch @500ms  t90
+              2.0         2.93     0.773       2.23      0.829
+              3.0         4.08     0.549       3.20      0.636
+              4.0         5.05     0.447       4.10      0.534
+              5.0         5.85     0.386       4.91      0.470
+
+          4.0 tracks inside the pulse window on both axes without the 17%
+          roll overshoot 5.0 shows.
+
+          TWO THINGS THIS DIVERGES FROM, both stated rather than resolved:
+
+          1. THE SIMULINK REFERENCE SAYS Kp = 3, all axes (controller.md,
+             "Structure"). The shipped 2.0 was already below it; 4.0 is
+             above. The reference is the source of truth for the control
+             law, so this is a deliberate departure from it, made to hit a
+             test-window requirement rather than because the reference was
+             found wrong. 3.0 is the value that restores reference
+             fidelity, at the cost of not settling inside 500 ms.
+
+          2. THE CEILING IS 5.09, SET BY PITCH. The rate loop rails when
+             FR_ATT_P * (45 deg design error) exceeds
+             authority / FR_RATE_*_FF: roll rails at 5.76 rad/s
+             (FR_ATT_P max 7.33), pitch at 4.00 rad/s (max 5.09). Pitch
+             binds, and it cannot be relieved by raising FR_RATE_P_FF --
+             that is envelope-limited at 0.1197 (findings.md (12)), not a
+             free choice. Guarded by
+             RateLoopStaysLinearOverAttitudeLoopDemand.
+
+          NOTE WHAT THE SIMULATION ALSO SHOWS: at every gain from 2.0 up,
+          a HELD 5 deg command converges (4.94 deg of 5 at FR_ATT_P = 2.0
+          within 3 s). The attitude loop already tracked attitude; what it
+          could not do was get there inside a 500 ms pulse. This raise buys
+          bandwidth, not correctness.
       type: float
-      default: 2.0
+      min: 0.5
+      max: 5.0
+      default: 4.0
     FR_PITCH_LEVER:
       description:
         short: Fraction of pitch moment routed through the body-x tilt lever
@@ -305,7 +396,8 @@ parameters:
           not comparable: Ixx = 0.0645 but Iyy = 0.0031 kg*m^2, so the
           shared gain gave pitch a P/I ratio of 1131/s against roll's
           54/s. Pitch also has ~11x less moment authority at hover
-          (0.34 vs 3.83 N*m, see FoldrotorControl.cpp's kRateMyLimit).
+          (0.34 vs 3.83 N*m, measured against the allocator by
+          FoldrotorControlTest.cpp's hoverMomentAuthority()).
 
           Default is the roll gain scaled by Iyy/Ixx, so the two axes
           have matched closed-loop bandwidth rather than matched gain.

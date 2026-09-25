@@ -13,6 +13,759 @@ here — see `reference/`.
 
 ---
 
+## 2026-09-25 (21) — Pitch's spring is the allocator's fixed geometry. CoM-referenced Phase 0, offline.
+
+**Resolves the origin of (19)'s 1.29 N*m/rad stiffness (89% of it).**
+Partially explains its anti-damping. Phase 1 (bench) not yet run.
+
+### Method
+
+`foldrotor3_tests/com_moment_analysis.py`: 29 body-FLU wrenches through
+the REAL `FoldrotorAllocation` (new `DISABLED_DumpAllocation` gtest -- no
+Python port, rule 7), each rotor command forward-mapped through the flight
+`model.sdf` with `expected_wrench.rotor_wrench()` (full pose chain, joint
+angles injected), resolved about the vehicle CoM **at those joint angles**.
+
+**Guard: allocator and SDF agree on FORCE to 7.5e-5 N** across all cases.
+Force is lever-independent, so this pins the joint mapping and every sign
+between them; the moment results below rest on it.
+
+### Thrust point: the allocator is the one that is off
+
+The user chose "match the real vehicle" on my claim that real thrust acts
+near the hub. **That claim was wrong**, checked against the prop mesh:
+blades span +4.6..+7.4 mm above the prop joint (mean +6.0), the prop
+link's CoM (where gz applies thrust) is +5.74 mm, and the joint origin
+`kS1z` is measured to is the BASE of the hub. So gz already models the
+real vehicle to 0.3 mm, and the allocator's pitch lever is ~6 mm short
+for both. No sim-vs-hardware trade-off exists.
+
+### The finding
+
+| case | intended My (FRD) | delivered about CoM | error |
+|---|---|---|---|
+| pure My 0.02..0.2 | as commanded | as commanded | **+0.0036 constant** (gain 1.00) |
+| pure Fx +1 N | 0 | -0.059 | -0.059 |
+| pure Fx +4 N | 0 | -0.290 | -0.290 |
+| pure Fx -4 N | 0 | +0.179 | +0.179 (nonlinear) |
+| pure Fy +1 N | Mx 0 | Mx -0.059 | same defect, roll |
+
+**Mechanism.** The allocator's `M0` is the geometry at ONE point: arms
+flat, thrust at the prop joint. Asked for body-x force, it also commands
+differential fold (~4.5 deg per N) to cancel the lever moment it thinks
+the force makes. Fold swings the 0.27 m arms, moving the rotors and the
+CoM by centimetres (the pitch lever is +22.8 mm arms-flat, +6.8 mm at
+10 deg of fold, sign-flipped past ~15 deg), so the compensation is itself
+wrong. The moment path is sound; the FORCE path leaks pitch.
+
+**Why it looks like a spring.** Holding tilt theta needs body-x force
+W*sin(theta), which leaks restoring pitch moment: **1.149 N*m/rad**
+(slope over +-2 deg), against **1.289 identified from flight -> 89%**,
+same sign, zero fitted parameters.
+
+### Closing the loop, parameter-free
+
+Iyy from model.sdf (0.04108), geometric stiffness 1.149, fold servo
+6.1 Hz / zeta 0.48 (from `FR_PITCH_LEVER`'s notes), shipped gains:
+
+| | in-window peak | ringing | zeta |
+|---|---|---|---|
+| flight, FR_ATT_P 4 | 2.73-2.86 deg | 1.07-1.18 Hz | ~0.02 |
+| model | **2.73** | **1.09 Hz** | 0.068 |
+| flight, FR_ATT_P 2 | 1.4-1.7 deg | -- | -- |
+| model at 2 (out of sample) | **1.47** | 0.95 Hz | 0.11 |
+| model WITHOUT geometry error | 4.10 | 0.58 Hz | 0.19 |
+
+Both flights' in-window peaks and the ringing frequency are reproduced.
+The servo lag makes the leaked moment act late, which does cost damping
+(0.095 -> 0.068) -- but **the flown 0.02 is not reached: roughly
+two-thirds of the damping deficit is still unexplained.** Candidates, not
+tested: the remaining 11% of stiffness, fold-arm reaction torque during
+motion, the tilt servo. Phase 2 (dynamic bench) territory.
+
+### Consequences for earlier entries
+
+- (19)'s confound is largely answered: this defect is present at EVERY
+  gain and predates (15)-(17). Raising `FR_ATT_P` 2 -> 4 lowered pitch
+  damping on top of it (model 0.11 -> 0.068), so both matter, but the
+  geometry is the root. (17)'s cap cannot contribute at the small tilts
+  the ringing lives at (< 2.9 deg is below both the old and new cap).
+- (20)'s conclusion that gains cannot fix it now has a reason: the plant
+  the loop sees has a tilt-dependent moment the allocator does not model.
+
+### The fix, and why it is not taken
+
+The real fix is a **fold-aware allocator**: rotor positions and CoM as
+functions of the current fold/tilt angles rather than one constant `M0`
+(plus the ~6 mm thrust-point correction). That changes the custom
+allocation algorithm, which `.claude/CLAUDE.md` rule 7 fences off, and it
+diverges from the Simulink `Control_Alloc` reference, which (as ported)
+also assumes fixed geometry. **User decision required.**
+
+### Guards added
+
+`foldrotor3_tests/test_com_moment.py` (skips if the PX4 test binary is not
+built): force agreement (pins mapping/signs); pure-My delivery passes the
+CoM acceptance criterion; pure-Fx zero-pitch criterion **xfail(strict)** as
+a known defect, so fixing the allocator forces the marker off; and a
+characterisation test pinning the 1.149 N*m/rad. `expected_wrench.py`
+gained `rotor_wrench()` (thrust in N), refactor verified byte-identical.
+Suite: 36 passed, 4 xfailed.
+
+Still open from this entry: the +0.0036 N*m constant pitch offset explains
+only ~1/6 of the +0.0226 N*m trim held in hover (20).
+
+---
+
+## 2026-09-25 (20) — Pitch's shortfall is its integrator limit against a stiff plant, not proportional gain
+
+Third commanded-attitude run, log `2026-09-25/05_22_36.ulg`: same config
+as (19), `FR_ATT_P` = 4.0 throughout, no parameter changes. It reproduces
+(19) leg for leg -- roll 5.10-5.11 deg of 5 in-window, pitch 2.73-2.86.
+**Not the A/B (19) asked for**; that is still unflown.
+
+### The identified model now reproduces the flight
+
+(19)'s output-error plant (Iyy 0.0424, stiffness 1.29 N*m/rad, damping
+-0.062, delay 12 ms), closed with the shipped gains: in-window pitch
+2.72 deg (flown 2.73-2.86), ringing zeta 0.019 (flown ~0.02).
+
+### What limits pitch
+
+Holding 5 deg against 1.29 N*m/rad needs **0.112 N*m** of steady moment.
+The P path's static gain is only `FF*K/(FF*K + k)` = 0.44/1.73 = 0.25, so
+the integrator must supply most of it -- and `FR_RATE_P_I_LIM` clamps it
+at **0.05 N*m**. Held 5 deg pitch therefore settles at
+`(0.44*0.0873 + 0.05)/1.73` = **2.93 deg** (sim 2.97). The one-shot window
+was never the only problem.
+
+**CORRECTS (18)**, which said "at every gain from 2.0 up, a HELD 5 deg
+command already converges (4.94 of 5 deg)" and that the gain raise "buys
+bandwidth, not correctness". That came from the model with stiffness
+0.334 and is FALSE for pitch. It was repeated to the user as a reason to
+prefer `--att stream`; retracted.
+
+### Model sweep, FR_ATT_P = 4.0 (half-validated model -- flight must confirm)
+
+| FF | Ki | I_LIM | held @3 s | held @10 s | pulse in-window | zeta |
+|---|---|---|---|---|---|---|
+| 0.110 | 0.112 | 0.05 | 2.69 | 2.97 | 2.72 | 0.019 |
+| 0.110 | 0.112 | 0.15 | 3.00 | 4.47 | 2.72 | 0.019 |
+| 0.140 | 0.143 | 0.25 | 3.80 | 4.83 | 3.03 | 0.052 |
+| 0.140 | 0.400 | 0.25 | 5.72 | 4.15 | 3.67 | **0.000** |
+| 0.140 | 0.800 | 0.25 | -- | **24.4** | 4.43 | **-0.049** |
+
+Held values still carry ringing at 10 s; read them as trends.
+
+- **`FR_RATE_P_I_LIM` is the gain that fixes held tracking.** 10 deg needs
+  1.29 x 0.1745 = 0.225 N*m, so 0.25 covers the planned 10 deg tests.
+  Still below the 0.440 N*m hover authority, so
+  `IntegratorLimitsStayBelowTheirAuthority` holds.
+- **`FR_RATE_P_FF` is the only damping knob** and is capped at 0.140 by
+  the linearity guard at `FR_ATT_P` = 4 (measured authority 0.440; (12)'s
+  0.1197 ceiling came from the deleted table's 0.188 envelope and is
+  superseded). At the cap zeta is only 0.052.
+- **Raising `FR_ATT_P` further is harmful**: 5.0 gives 3.25 deg in-window
+  but zeta 0.004. Faster `Ki` likewise trades damping for speed and goes
+  unstable by 0.8.
+- **No stable combination reaches 5 deg inside a 500 ms pulse.** In-window
+  pitch is bounded by FF and FF is capped; this is the stiff, low-authority
+  plant, not a tuning miss.
+
+Still open: why the plant is 3.8x stiffer than the lever predicts, and
+why it anti-damps. Pitch zeta stays low (~0.05) at every stable setting
+found, so the underlying cause matters more than any gain choice here.
+
+### Addendum, same day — gains cannot damp this mode; the gap is upstream
+
+Fourth run, `2026-09-25/05_30_05.ulg`: **default gains** (the proposed
+`FR_RATE_P_*` changes were never applied -- no `param set` in the log),
+one-shot. Pitch rms 0.57 deg, 88% of power at 1.10 Hz: unchanged from (19).
+User's report: "too much low frequency oscillations".
+
+Also measured: in quiet hover the loop holds **+0.023 N*m of steady pitch
+trim** (+5.6 deg differential fold), i.e. ~half of `FR_RATE_P_I_LIM` = 0.05
+is spent before any command arrives. Origin unknown (a ~1 mm CoM x-offset
+would do it).
+
+**Ring-down damping, model sweep** over `FR_ATT_P` 1-4, `FR_RATE_P_FF`
+0.11-0.20, `FR_WRENCH_LP` 5-20 Hz: **best zeta ~0.11 anywhere**, and more
+rate gain sometimes lowers it. No feedback-gain choice fixes a plant that
+behaves as stiff and anti-damped as this one does, so gain tuning is
+stopped here until the plant is explained.
+
+**The verification chain has a hole exactly here.** `.claude/CLAUDE.md`
+orders force/moment direction tests before closed-loop validation.
+`force_moment_test.md` passed 2026-09-06 -- PRE-mast -- and senses about
+the bench MOUNT, not the CoM; (12) already names "a CoM-referenced pitch
+direction test does not exist yet" as the main gap. Since the mast
+inverted `kS1z`, every pitch number depends on it.
+
+**And the bench cannot run it as-is:** `foldrotor3_bench/model.sdf` has
+**no `ballast_link`** (0 references; flight model has it). Same failure
+class as `00267a4` -- the bench is a full textual duplicate, and the mast
+was added to the flight copy only. Any bench measurement today describes
+the pre-mast vehicle. `test_frame_convention.py` asserts frame agreement
+between the two SDFs but evidently not mass/inertia parity.
+
+Next step: propagate the mast to the bench (and extend the parity test to
+cover links/masses), then run a CoM-referenced pitch moment test -- the
+unclimbed rung -- before any further pitch tuning.
+
+**Bench half DONE 2026-09-25** (user decision). Mast copied verbatim into
+`foldrotor3_bench/model.sdf` (submodule `Tools/simulation/gz`, branch
+`foldrotor3-ballast-mast`); full physics parity test added and shown to
+FAIL before the copy with exactly `bench is missing flight-model links
+['ballast_link'] and joints ['ballast_joint']`; clearance test extended to
+primitive geometry (it would otherwise have crashed on the mast's
+cylinders) with the disc pinned as the lowest point at 0.19 m.
+`foldrotor3_tests`: 26/26. Status recorded in `force_moment_test.md`.
+**CoM-referenced pitch test: not started.**
+
+---
+
+## 2026-09-24 (19) — Pitch is nearly undamped at hover. Cause NOT yet isolated. (18)'s simulation was not calibrated on pitch.
+
+Second commanded-attitude flight, log `2026-09-24/06_26_45.ulg`, same
+`-p 5 -r 5` one-shot hold run, `FR_ATT_P` = 4.0 confirmed in the log's
+initial parameters.
+
+### Roll did what (18) predicted
+
+Roll now reaches the command inside the window: peak 5.2 deg at 0.51 s on
+all three roll legs, against 5.05 predicted. Well damped afterwards.
+
+### Pitch did not, and it rings
+
+Pitch peaks at only 2.8 deg (4.10 predicted), then **oscillates at ~1.1 Hz
+with a damping ratio of ~0.02**, estimated by log decrement from the 20 Hz
+CSV across all three pitch legs (0.020 / 0.023 / 0.023). Still +-1.5 deg
+four seconds after each pulse. The script's 2 s console prints aliased it
+completely.
+
+**It is there with no command at all.** Clean-hover windows, compared
+against (14)'s baseline at `FR_ATT_P` = 2.0:
+
+| window | pitch rms | power in 0.9-1.5 Hz | roll rms |
+|---|---|---|---|
+| (14) baseline, FR_ATT_P 2.0 | **0.142 deg** | -- | 0.025 |
+| settle hover, before any pulse | **0.498 deg** | 90% | 0.019 |
+| pitch legs, 6-10 s after pulse | 0.55-0.61 deg | 88% | 0.015-0.019 |
+
+3.5x worse on pitch, unchanged on roll, and it is there with no command,
+so the pulses only made it visible.
+
+**CORRECTED same day: this does NOT show the gain raise caused it.** The
+first draft of this entry said it did. The baseline (06_38_09, 2026-09-22)
+predates FIVE changes -- (15) sphere, (16) rate-loop clamp removed,
+(17) 4 N body cap + unpin, and FR_ATT_P 2.0 -> 4.0 -- and no logged hover
+exists at any intermediate state. (16) and (17) are live suspects in their
+own right: (17) quadrupled the body force the pitch lever can carry, and
+the plant ID below finds a restoring stiffness 3.8x what that lever
+predicts. Isolating the cause needs an A/B in ONE session: same build,
+`param set FR_ATT_P 2.0`, hover, compare.
+
+### Not the allocator -- which also clears (16) on real data
+
+Across a pitch pulse: `saturated` 0.0%, **measured residual exactly zero**,
+differential fold +-10 deg of the +-45.3 deg rail, peak pitch moment 0.047
+N*m against 0.440 available. No rail, no rate limit. It is also the first
+real-flight check of `deliveredWrench()`: residual reads zero when nothing
+clips, so the forward map and the allocator's inverse agree on actual
+flight states, not just in the unit test.
+
+The controller's own `My` command oscillates at 1.18 Hz, locked to the
+pitch oscillation: a closed-loop mode, not an external disturbance.
+
+### Correcting (18)
+
+(18) called the cascade simulation "calibrated against a real run, not
+free-running". **That was true for roll only.** On pitch it had already
+predicted 2.23 deg against 1.5 deg flown at 2.0, and that gap was glossed.
+Adding the fold servo (6.1 Hz, zeta 0.48) does not close it either -- it
+makes the predicted peak HIGHER (4.4 deg) and the ringing WEAKER (0.40 vs
+1.5 deg). Whatever sets pitch's damping on this airframe is not in that
+model, so **it should not be used to choose pitch gains** until it
+reproduces this log.
+
+### Pitch plant identified from this log
+
+**Equation-error** (regress `qdot` on commanded `My`, theta, q) fit R2
+0.996 but its model went UNSTABLE when closed at `FR_ATT_P` = 2.0, which
+flew fine -- rejected. Not collinearity (condition number 3): an `qdot`
+fit spreads effort across all frequencies of a noisy 100 Hz derivative,
+while the ~1 Hz mode's net damping is a small difference of larger terms,
+so small coefficient errors flip its sign.
+
+**Output-error** (simulate the closed loop, fit the simulated pitch to the
+measured pitch across the three logged pulses) -- the method to trust:
+
+| | identified | previously assumed |
+|---|---|---|
+| Iyy | 0.0424 kg m^2 | 0.04108 (model.sdf) |
+| restoring stiffness | **+1.29 N*m/rad** | 0.334 (lever only) |
+| passive damping | **-0.062 N*m/(rad/s)** (anti-damping) | 0 |
+| lumped delay | 12 ms | -- |
+
+Fit: 99.5% of variance, 0.09 deg rms error. The stiffness agrees with the
+rejected equation-error fit (1.28), so it stands on two methods.
+
+Mechanism, if the model is right: the rate loop's only pitch damping is
+`FR_RATE_P_FF` = 0.11 N*m/(rad/s), and the plant removes 0.062 of it,
+leaving ~0.05 against a stiffness of 1.29 + 0.11*FR_ATT_P. That puts the
+mode at ~1 Hz, matching the flown 1.07 Hz.
+
+**Validation only half passes.** Out of sample (hover, same disturbance),
+the model predicts K=4 worse than K=2 by 1.5x; the logs show 3.5x. Either
+the model is incomplete, or the gap is (15)/(16)/(17) -- which is exactly
+what the A/B above would separate. **Do not tune pitch gains off this
+model until that A/B is flown.**
+
+Origin of the extra stiffness and the anti-damping is unknown. Candidates,
+unverified: the position/velocity loop acting back through the body-force
+lever (governed by (17)'s cap), and fold-arm reaction torque (0.0136
+kg m^2 about the fold axis, not in the allocator's M0).
+
+### Status
+
+`FR_ATT_P` stays at 4.0 (user decision: keep it, fix pitch's rate loop).
+That fix is ON HOLD until the one-session A/B isolates the cause. Script NOTE fixed: it hardcoded the old gain
+and printed "FR_ATT_P = 2.0" on this 4.0 flight.
+
+---
+
+## 2026-09-23 (18) — First commanded-attitude flight: the path works, the one-shot window measured a slew
+
+First flight with roll/pitch setpoints reaching the controller, on the
+unpin from (17). `attitude_setpoint_trajectory.sh -p 5 -r 5`, hold shape,
+six alternating legs, one-shot attitude per leg.
+
+### It works
+
+Both axes respond in the correct direction, the vehicle stayed stable
+throughout, position held to +-0.06 m, altitude -1.50 m, and yaw sat at
+90 deg for the whole run. No departure, no saturation event.
+
+### But the numbers are a slew, not tracking
+
+| leg | axis | cmd | peak | at-end |
+|---|---|---|---|---|
+| 0, 2, 4 | pitch | +5.0 | +1.7 / +1.5 / +1.4 | same |
+| 1, 3, 5 | roll | +5.0 | +2.8 / +2.8 / +2.9 | same |
+
+**`peak == at-end` on every leg**: the angle was still rising when the
+500 ms `kAttitudeSetpointTimeout` window closed. At `FR_ATT_P` = 2.0 a
+5 deg error gives a rate setpoint of exactly 10 deg/s, so 500 ms covers
+exactly 5 deg *with perfect rate tracking and zero lag*. The window and
+the command were matched exactly, leaving no margin to settle.
+
+### The response matches the gains, which is the real result
+
+Predicted initial angular-acceleration ratio from the shipped gains and
+the measured inertias:
+
+```
+roll   0.49 / 0.10247 = 4.78        pitch  0.11 / 0.04108 = 2.68
+predicted ratio 1.79        observed 2.83 / 1.53 = 1.85
+```
+
+Within 3%. The attitude path produces what the gain/inertia table
+predicts -- no sign error, no saturation, no allocator involvement. That
+is the first end-to-end confirmation the unpin is wired correctly.
+
+### What this flight did NOT establish
+
+- **Steady-state attitude tracking** -- never reached.
+- **The 4 N cap from (17).** Achieved tilt peaked at 2.9 deg, needing
+  0.99 N, i.e. inside what the OLD 1.0 N cap already allowed
+  (`asin(1/19.6014)` = 2.92 deg). The raise was not exercised.
+- **(16)'s measured-saturation path.** 0.029 N*m demanded against
+  0.440 N*m available; nothing came near saturating.
+
+### Consequent change: FR_ATT_P 2.0 -> 4.0 (user decision)
+
+Cascade simulation against measured inertias, shipped rate gains,
+`FR_WRENCH_LP` and measured authority, stepping 5 deg:
+
+| FR_ATT_P | roll @500ms | roll t90 | pitch @500ms | pitch t90 |
+|---|---|---|---|---|
+| 2.0 | 2.93 | 0.773 | 2.23 | 0.829 |
+| 3.0 | 4.08 | 0.549 | 3.20 | 0.636 |
+| **4.0** | **5.05** | **0.447** | **4.10** | **0.534** |
+| 5.0 | 5.85 | 0.386 | 4.91 | 0.470 |
+
+4.0 tracks inside the window on both axes without 5.0's 17% roll
+overshoot. Sim reproduces the flight at 2.0 (2.93/2.23 vs 2.8/1.5
+measured), so it is calibrated against a real run, not free-running.
+
+**Ceiling is 5.09, set by pitch**, from the existing linearity guard:
+roll rails at 5.76 rad/s (max 7.33), pitch at 4.00 rad/s (max 5.09). At
+4.0 the demand is 3.14 rad/s -- **27% margin, not generous**. Pitch
+cannot be relieved by raising `FR_RATE_P_FF`: that is envelope-limited at
+0.1197 (12), not a free choice.
+
+**Two divergences, stated not resolved:**
+1. Simulink specifies Kp = 3, all axes. Shipped was 2.0 (below), now 4.0
+   (above). This is a bandwidth decision taken against a test-window
+   requirement, not a finding that the reference is wrong. 3.0 restores
+   fidelity at the cost of not settling inside 500 ms.
+2. `controller_params.md` recorded 3.0 for this param while the module
+   shipped 2.0 -- a **stale spec row predating today**, corrected now.
+
+**The simulation's other finding, which matters for interpretation:** at
+every gain from 2.0 up, a HELD 5 deg command already converges (4.94 of
+5 deg within 3 s at 2.0). The attitude loop tracked attitude fine; what
+it could not do was arrive inside a 500 ms pulse. **This raise buys
+bandwidth, not correctness** -- `--att stream` would have shown tracking
+at the old gain.
+
+**NOT FLOWN at 4.0.** 97/97 unit tests pass.
+
+---
+
+## 2026-09-23 (17) — Body-force cap raised to 4 N and roll/pitch setpoints unpinned
+
+Two user decisions, taken together because the first gates the second.
+
+### `kBodyForceXYLimit` 1.0 -> 4.0 N
+
+This constant sets the tilt at which the vehicle stops being able to hold
+altitude, because the body-frame horizontal force at tilt theta is
+`W*sin(theta)` -- rotated COLLECTIVE, not commanded translation (the
+position loop's own horizontal request is bounded separately by
+`kPosVelForceXYLimit`, unchanged at 1.0 N).
+
+```
+theta_max = asin(cap / W)      W = 19.6014 N
+  1.0 N ->  2.9 deg   (what shipped until today)
+  4.0 N -> 11.8 deg
+```
+
+**The 2.9 deg figure is the point.** Any transient past ~3 deg -- a gust,
+not only a commanded attitude -- put the force path on its rail and the
+vehicle sagged. This was never a deliberate operating point; it is the
+pre-mast sizing left behind.
+
+**Why the old sizing no longer applies.** 1.0 N came from
+`0.4 * 0.146 / 0.0549`, bounding a DESTABILISING moment when the rotors
+sat 5.5 cm BELOW the CoM (+0.94 N*m/rad). The mast inverted the sign:
+`kS1z` is +0.017010, the coupling is RESTORING at -0.33 N*m/rad, so more
+body-horizontal force now produces more restoring moment. Raising the cap
+moves pitch toward stability, not away from it. This **closes the carried
+open item from (15)**.
+
+**Measured cost at 4 N** (against the real allocator at hover lift, since
+the predicted table is gone as of (16)):
+
+| | measured |
+|---|---|
+| rotor tilt required | 11.4 deg of the +-45.3 deg rail |
+| restoring moment produced | 4 x 0.01701 = 0.068 N*m |
+| hover authority, roll / **pitch** / yaw | 2.82 / **0.440** / 4.95 N*m |
+| so the moment cost is | 15% of pitch authority |
+
+Still feasible without clamping at 8 N, so 4 N is nowhere near an
+actuator constraint. Cross-check: -0.33 N*m/rad at 11.8 deg = 0.068 N*m,
+agreeing with the lever computation.
+
+### `euler_sp` unpinned
+
+`phi_sp`/`theta_sp` were fixed at zero since step 4e. They now come from a
+live `vehicle_attitude_setpoint` via
+`FoldrotorControl::resolveEulerSetpoint()`, falling back to exactly the
+previous behaviour when none is live. Level is still the default.
+
+**No PX4 precedent for this one**, unlike (16). `mc` cannot command
+attitude independently of position: `ControlMath::thrustToAttitude()`
+derives the attitude setpoint FROM the thrust vector
+(`bodyzToAttitude(-thr_sp, yaw_sp)`), consuming two of three attitude DOF
+to point the force, and `AttitudeControl::update()` then splits it back
+into reduced tilt plus a yaw delta weighted by `MC_YAW_WEIGHT` = 0.4.
+Only yaw is a free input there. mc's version of "command attitude" is
+Stabilized mode -- a separate mode that gives up position control, capped
+at `MPC_MAN_TILT_MAX` = 35 deg. The plumbing ported cleanly; the
+semantics had to be decided.
+
+**The two decisions, neither recoverable from the code:**
+1. A live attitude setpoint owns ALL THREE angles, yaw included. Splitting
+   the source would make the commanded attitude depend on which of two
+   unsynchronised publishers spoke last. Pinned by
+   `LiveSetpointOverridesTrajectoryYaw`.
+2. `kAttitudeSetpointTimeout` = 500 ms. **Mandatory here and nowhere else
+   in this module:** `uORB::Subscription::copy()` returns the last sample
+   forever, and `mavlink_receiver.cpp:1844` publishes this topic only
+   while OFFBOARD and only when a `SET_ATTITUDE_TARGET` arrives. Every
+   other setpoint the module consumes has a continuously-running producer.
+   Without the timeout a dropped link holds the last tilt indefinitely.
+   **OPEN: 500 ms is a first-cut number** (~10x a 20 Hz stream, inside
+   `COM_OF_LOSS_T`), not derived. It wants a decision or a parameter.
+
+### Expected asymmetry when this is exercised
+
+Holding 10 deg needs 0.058 N*m against the restoring term: **13% of
+pitch's measured authority, 2% of roll's**. Pitch is 6.4x weaker than
+roll and 11x weaker than yaw, and carries a deliberately slower gain
+(`FR_RATE_P_FF` 0.11 vs 0.49) since (12). An alternating pitch/roll test
+will not produce symmetric results, and that is expected, not a fault.
+
+### Status
+
+97/97 unit tests pass; `BodyForceCapSetsTheTiltAtWhichAltitudeIsLost`,
+`StaleOrUnusableSetpointFallsBackToLevel`,
+`LiveSetpointOverridesTrajectoryYaw` are the new guards. **NOT FLOWN.**
+
+Note also that with the pin removed, a commanded attitude step is now the
+only way this airframe deliberately demands large moment -- so it is also
+the validation case (16) has been waiting for, since a hover never drives
+the allocator into saturation.
+
+---
+
+## 2026-09-23 (16) — Rate-loop authority bound switched from predicted to measured, the PX4 way
+
+**User decision: "do what mc does."** The rate loop's output clamp and the
+`momentEnvelopeAtThrust()` table behind it are deleted. Saturation is now
+measured from the allocator.
+
+### What PX4 actually does, checked against the files
+
+| stage | how it bounds | file |
+|---|---|---|
+| `mc_pos_control` | vertical-priority sphere, in **normalized** thrust; `MPC_THR_MAX` default 1.0 with `max: 1` in the param metadata | `PositionControl.cpp:162-188` |
+| horizontal | a **tilt** limit, `MPC_TILTMAX_AIR` 45 deg, not a force limit; collective is then raised by `1/cos(tilt)` | `PositionControl.cpp:218-223` |
+| `mc_rate_control` | **nothing.** `update()` returns the raw PID torque | `rate_control.cpp:71-86` |
+| allocator | prioritised desaturation (thrust, roll, pitch, then yaw) then hard clip | `ControlAllocationSequentialDesaturation.cpp:173-228`, `ControlAllocation.cpp:77-91` |
+| feedback | `unallocated = setpoint - allocated`, published, read back into the rate loop's anti-windup | `ControlAllocator.cpp:648-657`, `MulticopterRateControl.cpp:199-215` |
+
+The structural point: **PX4 never predicts its authority, it measures the
+shortfall.** And because the whole stack is normalized, `MPC_THR_MAX`
+cannot be set above the actuators at all -- there is no PX4 equivalent of
+(15)'s T/W = 2.
+
+### The change here
+
+- `FoldrotorAllocation::deliveredWrench()` -- new, `allocate()` untouched
+  (rule 7). Runs allocation.md's forward map on the CLAMPED output and
+  multiplies by `M0`: the inverse journey of `T = Minv * w`.
+- `Run()` computes `resid = commanded - delivered`, converts FLU->FRD
+  (`frdToAllocatorFlu()` is its own inverse), and turns it into per-axis
+  flags with PX4's exact test.
+- `AttitudeRateControl::setOutputLimits()` -> `setSaturationStatus()`,
+  mirroring `RateControl::setSaturationStatus()`. `updateRate()` returns
+  the raw PID moment; `updateIntegral()` reads the flags.
+- Deleted: `momentEnvelopeAtThrust()`, `kRateM{x,y,z}Limit`, the per-cycle
+  re-scheduling, and the pitch-lever correction to the pitch row.
+
+### Why this is more than a refactor
+
+The 2026-09-18 and 2026-09-21 (5) revisions were each correcting a
+PREDICTED bound against measurement -- once too high (the loop integrated
+into a rail it could not see; five reproduced crashes), once too low (it
+believed itself saturated while authority remained). Deleting the
+prediction deletes the class of defect, not the two caught instances.
+
+It also closes two open items:
+- (12)'s request for a travel-based saturation indicator: `debug_array`
+  now carries the residual per axis (`kDebugResidMx/My/Mz`), and the
+  trace's `m_limit[3]` became `m_resid[3]`. Unlike `saturated`, which is
+  one bit for six axes and read 0.0% through an entire departure, the
+  residual says how much, on which axis, with which sign.
+- (15)'s carried pitch-lever sign error: the line that had it is gone.
+
+### What did NOT go: `fitWrenchToEnvelope()`
+
+Worth stating because the decision was phrased as "retire the table" and
+these are easy to conflate. The fit bisects against the **real allocator**
+in the actual commanded direction and never used the table (its own "WHY
+NOT A LOOKUP TABLE" note says so). It is this module's equivalent of
+`ControlAllocationSequentialDesaturation`, which `mc` has. Removing it
+would leave this module with strictly *less* than `mc` and reopen (8)'s
+sign-flipped `My`, because `allocate()` clamps without redistributing
+where PX4's allocator redistributes.
+
+### Scope and status
+
+Moments only, per the same decision; the force residual
+(`thrust_setpoint_achieved` / `acc_sp_xy_produced` in PX4) is not wired to
+`PositionVelocityControl` yet and is the obvious next diff -- more so
+after (15) let the force loop over-command by 8.4 N.
+
+**Unit tests only, NOT FLOWN.** 94/94 pass. New guards:
+`DeliveredWrenchRoundTripsAFeasibleWrench` (forward map is the exact
+inverse of `allocate()` wherever it did not clamp -- if the two drift
+apart every flag downstream becomes fiction, silently) and
+`DeliveredWrenchQuantifiesWhatSaturationOnlyFlags`.
+`IntegratorLimitsStayBelowTheirAuthority` and
+`RateLoopStaysLinearOverAttitudeLoopDemand` now measure hover authority
+off the allocator (`hoverMomentAuthority()`) instead of reading the table.
+
+---
+
+## 2026-09-23 (15) — Combined force sphere raised to T/W = 2, above what the airframe can produce
+
+**User decision, taken with the cost stated.** `kPosVelForceLimit` goes
+from a 28 N literal to `kPosVelForceTW * FR_VEL_Z_GRAV_FF` = 2 x 19.6014
+= **39.20 N**.
+
+### The airframe does not have T/W = 2
+
+Computed from the module's own constants and allocation.md's forward map
+(`Tx = F*sin(beta)`, `Tz = F*cos(beta)*cos(alpha)`), not measured in
+flight:
+
+| | N | x weight |
+|---|---|---|
+| vehicle weight (`FR_VEL_Z_GRAV_FF`) | 19.60 | 1.00 |
+| **sphere, as of this entry** | **39.20** | **2.00** |
+| rotor ceiling, 2 x `kMaxThrust` | 30.0 | **1.53** |
+| previous sphere | 28.0 | 1.43 |
+| max body-horizontal force with hover lift held | 19.78 | 1.01 |
+
+The horizontal row is tilt-rail limited, not thrust limited: holding
+`Tz` = 9.8 N per rotor at `beta` = `kMaxTilt` = 0.79 rad needs F = 13.92 N
+(inside the 15 N rotor limit) and yields `Tx` = 9.89 N per rotor.
+
+T/W 1.53 is not incidental -- (12) records the ballast mast taking it from
+1.97 to 1.53. Reaching a real T/W = 2 is `model.sdf` work (per-rotor
+thrust 15 -> 19.6 N, or less mast mass), not a controller constant.
+
+### What the change actually does
+
+The sphere's job was to stop the position loop ASKING for force that does
+not exist: 28 N sat under the 30 N rotor ceiling, so with the 8 N
+horizontal margin, commanded `Fz` was held to `sqrt(28^2 - 8^2)` = 26.8 N.
+At 39.20 N that becomes **38.4 N, i.e. 8.4 N above the rotor ceiling**.
+The sphere is now inert and the binding constraints are downstream:
+`fitWrenchToEnvelope()` and the allocator's per-rotor clamp.
+
+**Not instrumented.** (12) already records `saturated` reading 0.0% while
+`beta1` sat pinned to its -45.3 deg rail through an entire departure,
+because `fitWrenchToEnvelope()` absorbs infeasibility before the allocator
+sets that flag. So the force the loop now over-commands is absorbed
+silently, by the one mechanism known to be blind. A travel-based
+saturation indicator was already open from (12); this raises its priority.
+
+### Knock-ons
+
+- `IntegratorLimitsStayBelowTheirAuthority` compared `FR_VEL_Z_I_LIM`
+  against `28 - grav_ff`. The sphere is no longer an authority bound, so
+  that comparison would have gone vacuous in exactly the direction the
+  test exists to catch; it now uses `2 * kMaxThrust - grav_ff` = 10.4 N.
+  `FR_VEL_Z_I_LIM` = 3.0 N still passes.
+- Radius derived from `FR_VEL_Z_GRAV_FF`, not hardcoded, so it cannot go
+  stale the way the pre-mast 15.26 N literal did in (14). Non-positive
+  weight falls back to `2 * kMaxThrust`.
+- `kPosVelForceXYMargin` deliberately left at 8 N -- no decision was made
+  about it, and it is a reserve subtracted from the radius rather than a
+  fraction of it.
+- **`kBodyForceXYLimit` is unchanged at 1.0 N and still clips a commanded
+  tilt at 3.4 N.** This entry does not unblock the 10 deg attitude test
+  that prompted it; that remains blocked, and the constant remains stale
+  (its comment still cites the pre-mast `-0.0549` geometry, see below).
+
+### NOT YET FLOWN
+
+Unit tests only (`CombinedForceSphereIsTwoTimesWeightAndExceedsRotorCeiling`).
+No SITL run has exercised a command large enough to reach the old 28 N
+bound, so nothing here is confirmed against a log.
+
+### Carried open: `kBodyForceXYLimit` is stale
+
+Separate from the decision above, found while tracing it.
+`FoldrotorControl.hpp`'s 1.0 N body-horizontal cap is sized in its own
+comment from `0.4 * 0.146 / 0.0549`, all pre-mast numbers, and describes
+the body-x coupling as pitch-DESTABILISING. Post-mast `kS1z` is `+0.017010`
+and that coupling is RESTORING (-0.33 N*m/rad). Its neighbours
+`kRateM*Limit` and `kPitchLeverFxLimit` both carry `REVISED 2026-09-22`;
+this one was missed. Also latent: `FoldrotorControl.cpp:788` does
+`m_limit(1) += FR_PITCH_LEVER * kPitchLeverFxLimit * pitchLeverFrd()`,
+and `pitchLeverFrd()` is now **negative**, so it SUBTRACTS from the pitch
+limit where its own comment says it adds. Inert at the shipped
+`FR_PITCH_LEVER` = 0, wrong the moment anyone raises it.
+**CLOSED same day**: the pitch-lever line no longer exists (16), and
+`kBodyForceXYLimit` was re-sized to 4.0 N with post-mast reasoning (17).
+
+---
+
+## 2026-09-22 (14) — The (13) fix worked; a stale gravity feedforward was holding the vehicle 0.47 m low
+
+Verification flight for (13)'s two changes (D gains zeroed, `FR_WRENCH_LP`
+= 5 Hz). Log `2026-09-22/06_38_09.ulg`, 64.1 s armed, Offboard, position
+setpoint (0, 0, −1.50).
+
+### (13) is confirmed fixed — folded into controller.md / controller_params.md
+
+Same measurement as (13), groundtruth angular velocity logged at 59 Hz, so
+Nyquist is 29.5 Hz and an 18.8 Hz component would still be visible:
+
+| | (13), 06_12_34 | now, 06_38_09 |
+|---|---|---|
+| yaw rate rms | 1.06 rad/s | **0.0013 rad/s** |
+| yaw peak | 18.8 Hz | 0.67 Hz |
+| power > 10 Hz | 82% | 1.6% |
+| roll rate rms | 0.34 rad/s | **0.0010 rad/s** |
+| allocator `saturated` | — | 0.0% |
+
+Hover quality: horizontal ±0.08 m, attitude rms deviation 0.025° roll /
+0.142° pitch / 0.353° yaw, yaw drift −0.10° over 64 s (was 59° in (12)).
+
+Two carried opens from (13) are **closed** by this flight: the 59° yaw
+drift is gone even with `FR_RATE_YAW_I` still 0.0, and the blind
+`saturated` flag now reads 0.0% on a flight where the commanded angles
+genuinely are small (beta p2p 0.0008 rad), so it is no longer known to be
+misleading — but it was never fixed, only untested. Still worth a
+travel-based indicator before trusting it.
+
+### NEW: altitude never arrived — `FR_VEL_Z_GRAV_FF` was a pre-mast measurement
+
+Commanded −1.50 m, asymptoted at −1.03 m (EKF frame; groundtruth −1.31 m,
+the 0.31 m offset being the ballast disc's spawn height, not estimator
+bias). Motors at 0.59, no saturation anywhere.
+
+`FR_VEL_Z_GRAV_FF` = 15.260017 N is exactly 1.5571 kg × 9.8 — the
+2026-09-09 Part D bench measurement, taken before the ballast mast. The
+mast added 0.443 kg the same day and this was the one parameter not
+re-scaled with it.
+
+The integrator cannot cover the gap because `FR_VEL_Z_I_LIM` clamps it at
+3.0 N:
+
+```
+needed:   19.6014 − 15.260017 = 4.341 N
+integrator max:                 3.000 N   (railed)
+remainder via FF·e_v:           1.341 N
+→ 1.341 / 7.0 / 0.4           = 0.479 m of permanent altitude error
+```
+
+Measured 0.468 m. Reconstructed integrator sits at **−3.0001 N** across
+5778 samples, range ±0.006 N — dead on the rail.
+
+**Folded into `controller_params.md`** → "Gravity feedforward re-scaled
+(2026-09-22)", with the provenance change (bench measurement → computed
+from SDF mass) stated there, and guarded by
+`FoldrotorControlParamTest.GravityFeedforwardResidualFitsIntegrator`,
+confirmed to fail on the old value at 0.47907 m.
+
+### OPEN — `FR_VEL_Z_MAX_UP` runtime value disagrees with its spec
+
+`parameters.bson` persists `FR_VEL_Z_MAX_UP` = 1.0, the only `FR_` entry
+saved there. The yaml default is 0.3, and its description argues at length
+for 0.3 on roll-authority grounds ("At 0.3 m/s, Fz = 17.4 N and roll
+authority recovers to ~3.5 N·m"). The flown value was 1.0. Not resolved
+here: the roll-authority argument predates the ballast mast, which changed
+both the hover thrust and Ixx, so it may no longer hold — but the saved
+override means the documented value is not what flies. Decide and then
+either clear the override or update the spec.
+
+### Still open from (13), unchanged
+- Roll/pitch rate gains vs post-mast inertia (Ixx ×1.59, Iyy ×13.3).
+  `FR_RATE_P_FF` has since been re-derived to 0.11 on envelope grounds;
+  roll has not been revisited.
+- `IMU_DGYRO_CUTOFF` = 20 Hz — moot now that the D gains are zero, since
+  nothing consumes the filtered derivative.
+
+---
+
 ## 2026-09-22 (13) — The commanded wrench was unexecutable: derivative gains were pumping vibration into it, and the ballast mast silently invalidated the roll/pitch gains
 
 First hover-quality investigation after (12). User's report: hovering, but

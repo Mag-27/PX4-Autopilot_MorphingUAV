@@ -63,6 +63,15 @@ Simulink model). Must match allocation.md's expected input.
 ## Structure (confirmed from Simulink)
 Cascaded: position P (Kp=3, all axes) → velocity PID → attitude P
 (Kp=3, all axes) → rate PID → allocation.
+
+> **The attitude gain no longer matches this reference.** `FR_ATT_P`
+> shipped at 2.0 (below Kp = 3) and was raised to **4.0** on 2026-09-23
+> (above it) to make a commanded attitude settle inside the module's
+> 500 ms setpoint window. Stated here rather than silently reconciled:
+> the Simulink model remains the source of truth for the control law, and
+> this is a bandwidth decision taken against a test requirement, not a
+> finding that the reference is wrong. `FR_POS_P` is separately at 0.4,
+> also not 3. See `controller_params.md` and `findings.md` (18).
 - Velocity loop gains: X/Y use FF=6, I=1, D=1. Z (altitude) uses
   FF=7, I=7, D=0.1, plus an explicit +9.81 gravity feedforward and an
   extra summing junction not present on X/Y — confirm intentional, not
@@ -167,8 +176,10 @@ recoverable from the Simulink prose alone:
    as a literal added directly to the NED Z axis.** Originally `+9.81`,
    exactly as `controller_params.md` recorded, carrying two known
    problems rather than silently correcting them. **Resolved 2026-09-09**
-   (Open questions 3 and 4 below): under-scaled, now `15.260017` (the
-   measured hover weight); sign confirmed empirically correct as-is.
+   (Open questions 3 and 4 below): under-scaled, now `19.6014` (the
+   vehicle's weight; was `15.260017`, re-scaled 2026-09-22 for the
+   ballast mast — see `controller_params.md` "Gravity feedforward
+   re-scaled"); sign confirmed empirically correct as-is.
 
 **Status (step 4a, 2026-09-07; anti-windup REWORKED 2026-09-17): wired
 into `Run()` at 50 Hz.**
@@ -235,6 +246,35 @@ form. Decided by the user 2026-09-07.
    anti-windup and the integrator clamp are inert at runtime.** A
    parameter for the clamp is a new, unfilled gap in
    `controller_params.md`'s table.
+
+   **RESOLVED 2026-09-23 — the rate loop now does what `mc` does.**
+   `setOutputLimits()` is gone, and with it `momentEnvelopeAtThrust()`,
+   `kRateMxLimit`/`kRateMyLimit`/`kRateMzLimit` and the per-cycle
+   re-scheduling of them. In their place,
+   `AttitudeRateControl::setSaturationStatus()` takes per-axis booleans
+   derived from a **measured** residual: `Run()` calls
+   `FoldrotorAllocation::deliveredWrench()` on the clamped allocator
+   output and compares it to what was commanded, exactly as
+   `ControlAllocator.cpp:648-657` computes `unallocated_torque` and
+   `MulticopterRateControl.cpp:199-215` converts it to flags. The
+   one-cycle delay PX4 incurs over uORB is kept, since the flags are set
+   after this cycle's `updateRate()` has run.
+
+   Two consequences, both deliberate:
+   - **The rate loop no longer clamps its output.** `rate_control.cpp`
+     does not either; the allocator is the authority bound. Feasibility
+     is established downstream by `fitWrenchToEnvelope()`, which is this
+     module's equivalent of `ControlAllocationSequentialDesaturation` and
+     which was **not** removed — `FoldrotorAllocation::allocate()` clamps
+     without redistributing where PX4's allocator redistributes, so
+     removing the fit would leave this module with strictly less than
+     `mc`.
+   - **The pitch-lever correction to the pitch limit is gone**, together
+     with the latent sign error in it recorded by `findings.md`
+     2026-09-23 (15). A measured residual has no blind spot for the
+     lever to correct.
+
+   Detail in `findings.md` 2026-09-23 (16). **Unit-tested, not flown.**
 
 5. **The attitude loop owns body-x force as a pitch actuator (decided
    2026-09-21).** Previously `Fx` belonged entirely to the position
@@ -306,6 +346,39 @@ recoverable from this spec's prior text — detail in
    document's own explanation (Identified issue 1, below) for why the
    missing force-path rotation stayed hidden. psi_sp comes from
    `trajectory_setpoint.yaw`, held at the current heading when NaN.
+
+   **SUPERSEDED 2026-09-23 (user decision): unpinned.** Level remains the
+   DEFAULT and the thrust-vectoring premise is unchanged — what changes is
+   that zero is no longer the only option. `FoldrotorControl::
+   resolveEulerSetpoint()` takes the setpoint from a live
+   `vehicle_attitude_setpoint` (quaternion → ZYX Euler, the same
+   extraction used for the measured attitude), falling back to exactly the
+   previous behaviour otherwise.
+
+   Two things are decisions rather than derivations, recorded here because
+   neither is recoverable from the code:
+   - **A live attitude setpoint is authoritative for all three angles,
+     yaw included.** Splitting the source — tilt from the attitude
+     setpoint, yaw from `TrajectorySetpoint` — would make the commanded
+     attitude depend on which of two unsynchronised publishers spoke
+     last. Consequence: while an attitude setpoint is live, its yaw
+     overrides `trajectory_setpoint.yaw`.
+   - **A staleness timeout is mandatory here**, unlike anywhere else in
+     this module. `uORB::Subscription::copy()` has no "nothing new"
+     reading, and `mavlink_receiver.cpp:1844` publishes this topic only
+     while OFFBOARD and only on a `SET_ATTITUDE_TARGET`, so without it a
+     dropped link leaves the vehicle holding the last commanded tilt.
+     `kAttitudeSetpointTimeout` = 500 ms is a **first-cut value wanting a
+     decision or a parameter**, not a derived constraint.
+
+   **This is the one place in the cascade with no PX4 precedent.** `mc`
+   cannot command attitude independently of position at all:
+   `ControlMath::thrustToAttitude()` builds the attitude setpoint *from*
+   the thrust vector (`body_z = -thr_sp` normalised), so two of its three
+   attitude DOF are consumed pointing the force and only yaw is free.
+   This airframe is fully actuated and has all six, so the question is
+   well-posed here and unanswerable there. Detail in `findings.md`
+   2026-09-23 (17). **Unit-tested, not flown.**
 4. **Validity/NaN gating**: full `mc_pos_control`-style — estimator
    `_valid` flags plus `PX4_ISFINITE` on the setpoint, holding the
    previous wrench on invalid input and resetting the integrator on
@@ -365,10 +438,11 @@ order of magnitude above every closed-loop bandwidth in the cascade.
 
 Two ordering properties this relies on, both regression-tested
 (`FoldrotorWrenchLowPassTest`):
-1. A first-order low-pass of a signal bounded by ±`m_limit` is itself
-   bounded by ±`m_limit`, so running it after the rate loop's clamp
-   preserves the feasibility guarantee that `fitWrenchToEnvelope()` and
-   the conditional-integration anti-windup both rely on.
+1. A first-order low-pass of a signal bounded by ±L is itself bounded by
+   ±L. This mattered while the rate loop clamped its own output; since
+   2026-09-23 it does not, and `fitWrenchToEnvelope()` — which runs after
+   the filter — is what establishes feasibility, as it always was in the
+   directions the clamp never covered.
 2. The pitch lever is derived from the **filtered** moment, because the
    lever *is* the pitch moment expressed across the 0.0549 N·m/N arm. A
    lever taken from the unfiltered moment would not match the `Fx`

@@ -69,6 +69,7 @@
 #include <uORB/topics/trajectory_setpoint.h>
 #include <uORB/topics/vehicle_angular_velocity.h>
 #include <uORB/topics/vehicle_attitude.h>
+#include <uORB/topics/vehicle_attitude_setpoint.h>
 #include <uORB/topics/vehicle_control_mode.h>
 #include <uORB/topics/vehicle_land_detected.h>
 #include <uORB/topics/vehicle_local_position.h>
@@ -128,48 +129,128 @@ public:
 	 */
 	static matrix::Vector3f frdToAllocatorFlu(const matrix::Vector3f &v_frd);
 
-	// Rate-loop per-axis output limits, N*m in body FRD. Public for the
-	// same reason the mapping functions above are: so a test can pin them
-	// without standing up a work queue. The full derivation (and why
-	// these are the HOVER-constrained maxima, not the unconstrained ones)
-	// lives at the point of use in FoldrotorControl.cpp's
-	// parameters_updated(); revised 2026-09-21, see findings.md and
-	// FoldrotorAllocation.hpp OPEN ITEM (d).
+	/**
+	 * Resolve the attitude setpoint the cascade should track this cycle.
+	 *
+	 * Static and public for the same reason the mapping functions above
+	 * are: the precedence rule and the staleness guard are the
+	 * safety-relevant half of the 2026-09-23 unpin, and a stuck tilt is
+	 * the failure mode they exist to prevent -- so a test has to be able
+	 * to reach them without standing up a work queue.
+	 *
+	 * @param att_sp   latest vehicle_attitude_setpoint (may be stale/empty)
+	 * @param traj_sp  latest trajectory_setpoint, the fallback yaw source
+	 * @param psi_now  current heading, held when no yaw is commanded
+	 * @param now      hrt timestamp used for the staleness test
+	 * @return phi_sp/theta_sp/psi_sp, ZYX, to hand updateAttitude()
+	 */
+	static matrix::Eulerf resolveEulerSetpoint(const vehicle_attitude_setpoint_s &att_sp,
+			const trajectory_setpoint_s &traj_sp,
+			float psi_now, hrt_abstime now);
+
+	// RATE-LOOP OUTPUT LIMITS REMOVED 2026-09-23 ("do what mc does").
+	// kRateMxLimit/kRateMyLimit/kRateMzLimit and the scheduled envelope
+	// that modulated them are gone, along with momentEnvelopeAtThrust()
+	// itself -- the rate loop had exactly two consumers for that table, the
+	// output clamp and the anti-windup predicate, and both are now measured
+	// instead of predicted (AttitudeRateControl::setSaturationStatus(), fed
+	// from FoldrotorAllocation::deliveredWrench()). rate_control.cpp bounds
+	// its output nowhere, for the same reason.
 	//
-	// These must never exceed what the allocator can actually deliver
-	// while holding a hover: AttitudeRateControl's conditional-integration
-	// anti-windup uses them to decide whether it is saturated, so a limit
-	// above the true ceiling makes that detection silently blind. Guarded
-	// by FoldrotorAllocationTest.RateLimitsDoNotExceedHoverMomentAuthority.
-	// Peak of the scheduled envelope below, i.e. the most this vehicle can
-	// ever be asked for on each axis. REVISED 2026-09-21 (5), down from
-	// 3.8 / 0.30 / 3.8: those were each measured with the OTHER TWO AXES AT
-	// ZERO, which is not how the rate loop uses them -- it demands all
-	// three at once, every cycle. The simultaneously-deliverable envelope
-	// is roughly half the single-axis one.
-	// REVISED 2026-09-22 for the ballast mast geometry (hover thrust is
-	// now 19.62 N, not 15.27 N, and kS1z/kS2z changed sign). Re-measured
-	// with sitl_testing/allocation_study/gentable.py against the updated
-	// allocator, same method as the 09-21 (5) figures they replace.
-	static constexpr float kRateMxLimit = 1.52f;  ///< roll,  peak simultaneous
-	static constexpr float kRateMyLimit = 0.22f;  ///< pitch, peak simultaneous
-	static constexpr float kRateMzLimit = 2.56f;  ///< yaw,   peak simultaneous
+	// What did NOT go with it: fitWrenchToEnvelope(). That bisects against
+	// the REAL allocator in the actual commanded direction, never the table
+	// (see its own "WHY NOT A LOOKUP TABLE" note), and it is this module's
+	// equivalent of PX4's ControlAllocationSequentialDesaturation -- which
+	// mc very much has. Removing it would leave this module with strictly
+	// less than mc and reopen findings.md 2026-09-21 (8)'s sign-flipped My,
+	// because FoldrotorAllocation::allocate() clamps without redistributing
+	// where PX4's allocator redistributes.
 
 	// Hard ceiling on horizontal force magnitude, N. Declared here rather
 	// than beside the other position-loop limits in parameters_updated()
-	// because it is a matched pair with momentEnvelopeAtThrust()'s table
-	// (which is measured holding exactly this much in reserve), and the
-	// regression test has to be able to see both. Rationale at the point
-	// of use in FoldrotorControl.cpp.
+	// so the regression test can see it. It used to be a matched pair
+	// with momentEnvelopeAtThrust()'s table, which was measured holding
+	// exactly this much in reserve; that table was deleted 2026-09-23, so
+	// the constant now stands alone. Rationale at the point of use in
+	// FoldrotorControl.cpp.
 	static constexpr float kPosVelForceXYLimit = 1.0f;
 
-	// Hard ceiling on BODY-frame horizontal force, N. Sized from the pitch
-	// authority rather than the tilt rails: a body-forward force acts
-	// 5.5 cm below the CoM and pitches the vehicle nose-up, so this bounds
-	// that disturbance to ~40% of the hover pitch envelope
-	// (0.4 * 0.146 / 0.0549 = 1.06 N). Derivation at the point of use in
-	// Run(). This is the constant that makes pitch stable.
-	static constexpr float kBodyForceXYLimit = 1.0f;
+	// Hard ceiling on BODY-frame horizontal force, N. This is the force
+	// that keeps lift pointing UP while the vehicle is tilted: at tilt
+	// theta the body-frame horizontal component is W*sin(theta), almost
+	// entirely rotated COLLECTIVE rather than commanded translation (the
+	// position loop's own horizontal request is bounded separately, by
+	// kPosVelForceXYLimit). So this constant sets the tilt at which the
+	// vehicle stops being able to hold altitude:
+	//
+	//     theta_max = asin(kBodyForceXYLimit / W)
+	//
+	// RAISED 1.0 -> 4.0 N, 2026-09-23 (user decision). 4 N buys 11.8 deg
+	// at W = 19.6014 N, against 2.9 deg at 1.0 N.
+	//
+	// WHY THE OLD VALUE NO LONGER APPLIES. 1.0 N was sized as
+	// 0.4 * 0.146 / 0.0549 to bound a DESTABILISING moment, back when the
+	// rotors sat 5.5 cm BELOW the CoM and body-horizontal force pitched
+	// the vehicle further nose-up (+0.94 N*m/rad). The ballast mast
+	// inverted that sign: kS1z is +0.017010 now and the coupling is
+	// RESTORING, -0.33 N*m/rad. More body-horizontal force therefore
+	// produces more RESTORING moment, so raising this cap moves pitch in
+	// the stabilising direction. The constant was missed in the
+	// 2026-09-22 mast sweep that revised its neighbours -- carried as an
+	// open item by findings.md 2026-09-23 (15), closed by (17).
+	//
+	// Measured cost at 4 N, against the real allocator at hover lift:
+	// 11.4 deg of rotor tilt out of the +-45.3 deg rail (a quarter of
+	// travel), and 4 * 0.01701 = 0.068 N*m of restoring moment, 15% of the
+	// measured 0.440 N*m hover pitch authority. Feasible without clamping
+	// all the way to 8 N, so 4 N is nowhere near an actuator constraint.
+	static constexpr float kBodyForceXYLimit = 4.0f;
+
+	// Combined force-magnitude sphere radius (PositionVelocityControl's
+	// setForceLimits()), expressed as a MULTIPLE OF VEHICLE WEIGHT: the
+	// radius is computed in parameters_updated() as
+	// kPosVelForceTW * FR_VEL_Z_GRAV_FF, never stored as a literal.
+	//
+	// USER DECISION 2026-09-23: T/W = 2, i.e. 2 * 19.6014 = 39.20 N,
+	// replacing the 28 N placeholder that had stood since 2026-09-17.
+	//
+	// STATED PLAINLY, because this constant no longer does the job its
+	// predecessor did. 39.20 N is above every force this airframe can
+	// produce: two rotors at kMaxThrust give 30 N (T/W = 1.53), and with
+	// hover lift held the +-kMaxTilt rails cap body-horizontal force at
+	// 19.78 N (T/W = 1.01). The 28 N value sat just under the 30 N rotor
+	// ceiling, so it kept the position loop from ever ASKING for more force
+	// than exists; with an 8 N margin it held commanded Fz to 26.8 N. At
+	// 39.20 N that becomes 38.4 N, i.e. 8.4 N above what the rotors can
+	// deliver, and the binding constraints move downstream to
+	// fitWrenchToEnvelope() and the allocator's per-rotor clamp. The loss
+	// is not instrumented either -- findings.md 2026-09-22 (12) records
+	// `saturated` reading 0.0% while beta sat pinned to its rail through a
+	// whole departure.
+	//
+	// Expressed against FR_VEL_Z_GRAV_FF rather than hardcoded in newtons
+	// so it cannot go stale the way the pre-mast weight literal did
+	// (findings.md 2026-09-22 (14): a 15.26 N constant the ballast mast
+	// left behind cost 0.47 m of altitude). A non-positive weight param
+	// falls back to the airframe's own rotor ceiling, 2 * kMaxThrust.
+	static constexpr float kPosVelForceTW = 2.0f;
+
+	// How long a vehicle_attitude_setpoint stays authoritative, us.
+	//
+	// This exists because uORB::Subscription::copy() keeps returning the
+	// LAST published sample forever -- there is no "nothing new" reading.
+	// Every other setpoint this module consumes has a producer that runs
+	// continuously, so staleness never mattered; an attitude setpoint does
+	// not. mavlink_receiver.cpp:1844 publishes vehicle_attitude_setpoint
+	// only while nav_state is OFFBOARD and only when a SET_ATTITUDE_TARGET
+	// actually arrives, so a dropped link or a mode change would otherwise
+	// leave this module holding the last commanded tilt indefinitely.
+	//
+	// FIRST-CUT VALUE, not derived from anything: 500 ms is ~10x the 20 Hz
+	// a sane offboard stream runs at, and well inside COM_OF_LOSS_T. It
+	// wants a decision or a parameter -- recorded as an open item in
+	// findings.md 2026-09-23 (17) rather than presented as a constraint.
+	static constexpr hrt_abstime kAttitudeSetpointTimeout = 500_ms;
 
 	// --- Pitch tilt lever (2026-09-21, architecture change) ------------
 	//
@@ -180,10 +261,12 @@ public:
 	// in intent, and collapsing them into one budget is what left pitch
 	// with no usable actuator:
 	//
-	//   position-loop Fx  -> DESTABILISING. Wanting to translate while
-	//                        tilted asks for body-forward force, which
-	//                        pitches further nose-up (findings.md (9)).
-	//                        Keep it fenced off: kBodyForceXYLimit.
+	//   position-loop Fx  -> was DESTABILISING pre-mast: wanting to
+	//                        translate while tilted asked for body-forward
+	//                        force, which pitched further nose-up
+	//                        (findings.md (9)). Post-mast the sign is
+	//                        inverted and kBodyForceXYLimit is a tilt/
+	//                        altitude budget rather than a fence.
 	//   attitude-loop Fx  -> STABILISING. The rate loop aims the same
 	//                        lever with the sign that corrects pitch.
 	//                        Give it room: this constant.
@@ -198,42 +281,6 @@ public:
 	// that cannot itself destabilise anything.
 	static constexpr float kPitchLeverFxLimit = 2.0f;
 
-	/**
-	 * Moment authority simultaneously available on ALL THREE axes at a
-	 * given collective Fz, N*m, body FRD.
-	 *
-	 * This replaces rollAuthorityAtThrust() (2026-09-21 (4)), which was
-	 * right in kind but wrong in scope. Two errors it corrects:
-	 *
-	 * 1. It scheduled ONLY roll, on the reasoning that measured yaw
-	 *    authority RISES with Fz and pitch is flat. Both of those
-	 *    measurements were taken one axis at a time. Demanded together --
-	 *    which is what the rate loop actually does -- all three collapse,
-	 *    because they compete for the same two rotor thrust vectors. At
-	 *    Fz = 17.36 N the single-axis maxima are 3.43 / 0.39 / 4.38 N*m but
-	 *    the simultaneous envelope is only 1.75 / 0.17 / 2.17.
-	 *
-	 * 2. It modelled authority as differential thrust alone, ignoring the
-	 *    +-kMaxTilt rails on alpha and beta. Those rails, not the thrust
-	 *    budget, are what actually binds once any horizontal force is
-	 *    commanded alongside a moment.
-	 *
-	 * The table is a measured bisection of the REAL allocator (feasibility
-	 * = no clamp on F, alpha or beta for either rotor) over the worst-case
-	 * horizontal direction, holding |Fxy| <= kPosVelForceXYLimit in
-	 * reserve, then scaled by 0.85. Generated by
-	 * sitl_testing/allocation_study/gentable.py; regenerate it there if the
-	 * geometry constants or kMaxTilt/kMaxThrust ever change.
-	 *
-	 * Note the envelope is NOT monotonic: it peaks near Fz ~ 18-20 N and
-	 * collapses toward zero at both ends -- at 30 N both rotors are pinned
-	 * at kMaxThrust with nothing left to differentiate, and at 0 N there is
-	 * no thrust to vector. This is why a single constant could not express
-	 * it and why FR_VEL_Z_MAX_UP matters so much (2026-09-21 (3)).
-	 *
-	 * Guarded by FoldrotorAllocationTest.ScheduledMomentEnvelopeIsDeliverable.
-	 */
-	static matrix::Vector3f momentEnvelopeAtThrust(float fz_n);
 
 	/**
 	 * Scale a wrench down to the actuator envelope, in body FLU and in
@@ -381,11 +428,14 @@ private:
 	 * corner sits an order of magnitude above every loop and below every
 	 * actuator pole, costing ~7 deg of phase at the fastest loop.
 	 *
-	 * ORDERING. Applied AFTER the rate loop's own output clamp, so the
-	 * envelope guarantee survives: a first-order low-pass of a signal
-	 * bounded by +/-m_limit is itself bounded by +/-m_limit, so
-	 * fitWrenchToEnvelope() and the anti-windup still see a feasible
-	 * request. Unity DC gain, so no steady-state trim is altered.
+	 * ORDERING. Applied after the rate loop and BEFORE
+	 * fitWrenchToEnvelope(), which is what establishes feasibility. Until
+	 * 2026-09-23 the rate loop clamped its own output and this filter
+	 * inherited that bound (a first-order low-pass of a signal bounded by
+	 * +/-L is itself bounded by +/-L); the clamp is gone, so the fit is
+	 * now the only thing guaranteeing the allocator a satisfiable request
+	 * -- which it always was in the directions the clamp did not cover.
+	 * Unity DC gain, so no steady-state trim is altered.
 	 */
 	AlphaFilter<matrix::Vector3f> _wrench_lp_force{};
 	AlphaFilter<matrix::Vector3f> _wrench_lp_moment{};
@@ -428,7 +478,7 @@ private:
 	uORB::Publication<debug_array_s> _debug_array_pub{ORB_ID(debug_array)};
 
 	// Slot layout of the single "fr_alloc" debug_array. Named constants
-	// rather than bare indices because sitl_testing/plot_hover.py decodes
+	// rather than bare indices because sitl_testing/plot_sitl_log.py decodes
 	// the same layout by position and there is nothing in the message to
 	// catch a mismatch. DebugArray.msg ARRAY_SIZE is 58; 13 used.
 	static constexpr int kDebugF1        = 0;
@@ -444,7 +494,15 @@ private:
 	static constexpr int kDebugWrenchMx  = 10;
 	static constexpr int kDebugWrenchMy  = 11;
 	static constexpr int kDebugWrenchMz  = 12;
-	static constexpr int kDebugSlotsUsed = 13;
+	// Measured allocator residual (asked - delivered), body FRD, N*m --
+	// added 2026-09-23 alongside the anti-windup feedback. This is the
+	// travel-based indicator findings.md 2026-09-22 (12) asked for: unlike
+	// kDebugSaturated it says HOW MUCH was not delivered, and on which
+	// axis, rather than only that something clipped.
+	static constexpr int kDebugResidMx   = 13;
+	static constexpr int kDebugResidMy   = 14;
+	static constexpr int kDebugResidMz   = 15;
+	static constexpr int kDebugSlotsUsed = 16;
 
 	// DIAGNOSTIC (temporary -- remove when findings.md's flip
 	// investigation closes).
@@ -472,7 +530,7 @@ private:
 		float rate_sp[3];       ///< rate setpoint out of the attitude stage, FRD
 		float m_b[3];           ///< rate-loop moment output, FRD N*m
 		float f_b[3];           ///< position-loop force output, FRD N
-		float m_limit[3];       ///< moment authority granted this cycle, N*m FRD
+		float m_resid[3];       ///< measured allocator residual, asked - delivered, N*m FRD
 		uint8_t saturated;      ///< allocator clamped a channel
 		uint8_t armed;
 	};
@@ -525,6 +583,7 @@ private:
 	uORB::Subscription _vehicle_local_position_sub{ORB_ID(vehicle_local_position)};
 	uORB::Subscription _vehicle_attitude_sub{ORB_ID(vehicle_attitude)};
 	uORB::Subscription _trajectory_setpoint_sub{ORB_ID(trajectory_setpoint)};
+	uORB::Subscription _vehicle_attitude_setpoint_sub{ORB_ID(vehicle_attitude_setpoint)};
 	uORB::Subscription _vehicle_control_mode_sub{ORB_ID(vehicle_control_mode)};
 	uORB::Subscription _vehicle_land_detected_sub{ORB_ID(vehicle_land_detected)};
 

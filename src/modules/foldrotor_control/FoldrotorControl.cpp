@@ -74,50 +74,35 @@ FoldrotorControl::foldToNormalizedServo(float alpha_rad)
 	return math::constrain(alpha_rad / foldrotor::FoldrotorAllocation::kMaxTilt, -1.f, 1.f);
 }
 
-matrix::Vector3f
-FoldrotorControl::momentEnvelopeAtThrust(float fz_n)
+matrix::Eulerf
+FoldrotorControl::resolveEulerSetpoint(const vehicle_attitude_setpoint_s &att_sp,
+				       const trajectory_setpoint_s &traj_sp,
+				       float psi_now, hrt_abstime now)
 {
-	// Measured simultaneous moment envelope, bisected against the real
-	// allocator on a uniform 2 N grid from 0 to 30 N. See the header for
-	// the derivation and why a scalar roll-only schedule was wrong.
-	// Fz(N) : Mx, My, Mz  (N*m, |Fxy| <= kPosVelForceXYLimit, x0.85)
-	static constexpr int kN = 16;
-	static constexpr float kStep = 2.f;
-	static constexpr float kTable[kN][3] = {
-		{ 0.000f,  0.000f,  0.000f},   //  0 N
-		{ 0.084f,  0.008f,  0.123f},   //  2 N
-		{ 0.307f,  0.026f,  0.324f},   //  4 N
-		{ 0.529f,  0.045f,  0.529f},   //  6 N
-		{ 0.742f,  0.064f,  0.743f},   //  8 N
-		{ 0.955f,  0.083f,  0.957f},   // 10 N
-		{ 1.169f,  0.102f,  1.172f},   // 12 N
-		{ 1.382f,  0.121f,  1.386f},   // 14 N
-		{ 1.593f,  0.140f,  1.603f},   // 16 N
-		{ 1.542f,  0.180f,  2.050f},   // 18 N
-		{ 1.214f,  0.190f,  2.164f},   // 20 N
-		{ 0.895f,  0.176f,  1.990f},   // 22 N
-		{ 0.661f,  0.151f,  1.685f},   // 24 N
-		{ 0.433f,  0.120f,  1.320f},   // 26 N
-		{ 0.210f,  0.080f,  0.846f},   // 28 N
-		{ 0.000f,  0.000f,  0.000f},   // 30 N
-	};
+	// "Live" means published within kAttitudeSetpointTimeout AND carrying
+	// a usable quaternion. The timeout is not optional: uORB::Subscription
+	// ::copy() keeps returning the last sample forever, and
+	// mavlink_receiver.cpp:1844 publishes this topic only while OFFBOARD
+	// and only when a SET_ATTITUDE_TARGET arrives -- so without it, a
+	// dropped link leaves the vehicle holding the last commanded tilt.
+	const matrix::Quatf q_sp(att_sp.q_d);
+	const bool fresh = (att_sp.timestamp != 0) && (now < att_sp.timestamp + kAttitudeSetpointTimeout);
+	const bool usable = PX4_ISFINITE(q_sp(0)) && PX4_ISFINITE(q_sp(1))
+			    && PX4_ISFINITE(q_sp(2)) && PX4_ISFINITE(q_sp(3))
+			    && (q_sp.norm() > FLT_EPSILON);
 
-	// Sign-independent: Fz is DOWN-positive in FRD, so a hovering vehicle
-	// presents a negative value here, but the envelope depends only on how
-	// hard the rotors are driven.
-	const float fz = fabsf(fz_n);
-	const float idx = math::constrain(fz / kStep, 0.f, float(kN - 1));
-	const int i0 = int(idx);
-	const int i1 = math::min(i0 + 1, kN - 1);
-	const float frac = idx - float(i0);
-
-	matrix::Vector3f env;
-
-	for (int a = 0; a < 3; a++) {
-		env(a) = kTable[i0][a] + frac * (kTable[i1][a] - kTable[i0][a]);
+	if (fresh && usable) {
+		// Authoritative for ALL THREE angles -- see the decision note at
+		// the call site. Same ZYX (3-2-1) extraction the module uses for
+		// the measured attitude, so state and setpoint share one
+		// convention (controller.md, Interface).
+		return matrix::Eulerf(q_sp);
 	}
 
-	return env;
+	// Fallback is exactly the pre-unpin behaviour: level, yaw from
+	// TrajectorySetpoint, holding the current heading when that is NaN
+	// ("do not control yaw", per that message's own contract).
+	return matrix::Eulerf(0.f, 0.f, PX4_ISFINITE(traj_sp.yaw) ? traj_sp.yaw : psi_now);
 }
 
 void
@@ -130,11 +115,11 @@ FoldrotorControl::applyWrenchLowPass(matrix::Vector3f &F_frd, matrix::Vector3f &
 	// 2026-09-22/06_12_34.ulg saturated trying to follow it.
 	//
 	// A first-order low-pass of a signal bounded by +/-L is itself bounded
-	// by +/-L (the state is a convex combination of past samples), so
-	// running this AFTER the rate loop's output clamp preserves the
-	// envelope guarantee that fitWrenchToEnvelope() and the
-	// conditional-integration anti-windup both rely on. Unity DC gain, so
-	// no steady-state trim is altered.
+	// by +/-L (the state is a convex combination of past samples). That
+	// mattered when the rate loop still clamped its own output; since
+	// 2026-09-23 it does not, and feasibility is established after this
+	// filter by fitWrenchToEnvelope() instead. Unity DC gain, so no
+	// steady-state trim is altered either way.
 	if (!(cutoff_hz > 0.f) || !(dt > FLT_EPSILON)) {
 		// Bypassed. Re-arm the seed so that enabling FR_WRENCH_LP in
 		// flight starts from the live command rather than stepping out
@@ -177,17 +162,25 @@ FoldrotorControl::fitWrenchToEnvelope(matrix::Vector3f &F_flu, matrix::Vector3f 
 	// does not change the allocation algorithm; it guarantees the algorithm
 	// is only ever handed inputs it can satisfy exactly.
 	//
-	// WHY NOT A LOOKUP TABLE. momentEnvelopeAtThrust() indexes on collective
-	// thrust alone, holding a fixed |Fxy| <= kPosVelForceXYLimit in reserve.
-	// That assumption is only valid while the vehicle is near level. The
-	// horizontal cap is applied in the INERTIAL frame, but the allocator's
-	// alpha/beta rails are BODY constraints -- so once the vehicle tilts,
-	// the body-frame horizontal force grows without bound (at 73 deg of
-	// pitch, holding altitude needs ~17 N of body-forward force) and the
-	// table's premise collapses. The table is kept for the rate loop's
-	// output limits, where a cheap, monotone, always-nonzero bound is what
-	// the anti-windup needs; feasibility is enforced here instead, against
-	// the real allocator and the actual commanded direction.
+	// WHY NOT A LOOKUP TABLE. The module used to carry one --
+	// momentEnvelopeAtThrust(), indexed on collective thrust alone while
+	// holding a fixed |Fxy| <= kPosVelForceXYLimit in reserve. That
+	// assumption is only valid near level: the horizontal cap is applied
+	// in the INERTIAL frame while the allocator's alpha/beta rails are
+	// BODY constraints, so once the vehicle tilts the body-frame
+	// horizontal force grows without bound (at 73 deg of pitch, holding
+	// altitude needs ~17 N of body-forward force) and the table's premise
+	// collapses. The table was deleted 2026-09-23 for exactly that reason
+	// once its last consumer -- the rate loop's output clamp and
+	// anti-windup predicate -- moved to measured allocator feedback.
+	// Feasibility is enforced HERE instead, against the real allocator and
+	// the actual commanded direction, and always was.
+	//
+	// This function is NOT the table and did not go with it. It is this
+	// module's equivalent of PX4's ControlAllocationSequentialDesaturation
+	// (prioritised desaturation before clipping), which mc has and which
+	// FoldrotorAllocation::allocate() deliberately does not -- see the
+	// clamp-not-redistribute note above.
 	//
 	// PRIORITY. Vertical force first (without it the vehicle falls), then
 	// moment (without it the vehicle tumbles, and a tumbled vehicle cannot
@@ -385,7 +378,20 @@ FoldrotorControl::parameters_updated()
 	// arm) -- NOT a re-derivation of Control_Alloc.m. These are placeholders
 	// to stop the runaway, unverified against a logged clean hover -- see
 	// findings.md OPEN ITEM and PositionVelocityControl.hpp OPEN ITEM (a).
-	static constexpr float kPosVelForceLimit = 28.f;      // N, combined magnitude ceiling
+	//
+	// REVISED 2026-09-23 (user decision): the combined ceiling is no longer
+	// the 28 N literal the block above derives, but kPosVelForceTW times
+	// the configured vehicle weight = 39.20 N. See kPosVelForceTW in
+	// FoldrotorControl.hpp for what that costs -- in short, the sphere no
+	// longer holds the loop to anything the actuators can deliver, and the
+	// 30 N rotor ceiling is enforced only downstream of here.
+	//
+	// The margin is deliberately UNTOUCHED at 8 N: no decision was made
+	// about it, and it is a reserve SUBTRACTED from the radius rather than
+	// a fraction of it, so it keeps its meaning as the radius moves.
+	const float pos_vel_force_limit = (_gains.vel_z_grav_ff > 0.f)
+					  ? kPosVelForceTW * _gains.vel_z_grav_ff
+					  : 2.f * foldrotor::FoldrotorAllocation::kMaxThrust;
 	static constexpr float kPosVelForceXYMargin = 8.f;    // N, horizontal force held back when saturating Z
 
 	// ADDED 2026-09-21 (5). The sphere above is the wrong SHAPE for this
@@ -422,58 +428,34 @@ FoldrotorControl::parameters_updated()
 	// two-rotor vehicle with +-45 deg of tilt has left after it finishes
 	// holding itself up and keeping itself upright. Attitude outranks
 	// position here; that ordering is not tunable, it is the airframe.
-	// momentEnvelopeAtThrust()'s table is measured holding exactly this
-	// much horizontal force in reserve, so the two constants are a matched
-	// pair -- change one and regenerate the other with
-	// allocation_study/gentable.py. The constant itself is declared in
-	// FoldrotorControl.hpp so the regression test can see it.
+	// This used to be a matched pair with momentEnvelopeAtThrust()'s
+	// table, which was measured holding exactly this much horizontal
+	// force in reserve. The table is gone as of 2026-09-23, so the
+	// coupling is gone with it and this constant now stands alone. The
+	// constant itself is declared in FoldrotorControl.hpp so the
+	// regression test can see it.
 
-	// RESOLVED 2026-09-18 (findings.md): these were placeholders that
-	// overestimated the allocator's true per-axis moment authority --
-	// verified by numerically maximizing |Mx|/|My|/|Mz| over the full
-	// actuator box (F1,F2 in [0,15] N, alpha1,2/beta1,2 in [-0.79,0.79]
-	// rad) via FoldrotorAllocation's own forward map, cross-checked with
-	// both a brute-force grid search and scipy.optimize (multiple random
-	// restarts), all three methods agreeing to 5+ significant figures:
-	//   true max |Mx| ~= 4.06 N*m  (was 8.0,  ~2.0x too high)
-	//   true max |My| ~= 0.90 N*m  (was 1.5,  ~1.67x too high)
-	//   true max |Mz| ~= 5.77 N*m  (was 6.0,  ~1.04x, negligible)
-	// Because setOutputLimits()/updateIntegral()'s conditional-integration
-	// anti-windup (AttitudeRateControl.hpp) uses these constants to decide
-	// "am I saturated", overestimating them left the rate loop's own
-	// saturation detection blind across the gap between the true ceiling
-	// and the configured one -- the rate loop believed it was within
-	// bounds while the allocator was already clamping individual channels
-	// to their rails trying to deliver an unachievable moment, producing
-	// a bang-bang limit-cycle chatter on alpha/beta traced through five
-	// reproduced free-flight crashes (findings.md, 2026-09-18 entries).
-	// Set here to the true achievable maxima with a small margin held
-	// back, same pattern as kPosVelForceLimit/kPosVelForceXYMargin above.
+	// RATE-LOOP OUTPUT BOUNDS REMOVED 2026-09-23 ("do what mc does").
+	// kRateMxLimit/kRateMyLimit/kRateMzLimit, the scheduled
+	// momentEnvelopeAtThrust() table and the clamp they drove are all
+	// gone. The rate loop now learns what it could not deliver from the
+	// allocator itself, which is what PX4 does: rate_control.cpp bounds
+	// its output nowhere, and MulticopterRateControl.cpp:199-215 feeds it
+	// measured saturation flags instead. See
+	// AttitudeRateControl::setSaturationStatus() and the residual computed
+	// after allocate() in Run().
 	//
-	// REVISED 2026-09-21 (findings.md 2026-09-21, and see
-	// FoldrotorAllocation.hpp OPEN ITEM (d)). The 4.06/0.90/5.77 figures
-	// above maximize each moment over the whole actuator box with the
-	// FORCE left free -- i.e. they are reachable only if the vehicle is
-	// willing to stop holding itself up. The number the rate loop
-	// actually needs is the moment reachable *while hovering*: Fz = the
-	// vehicle's weight, Fx = Fy = 0, other two moments 0. Re-measured
-	// under that constraint against the sign-corrected allocator
-	// (sitl_testing/allocation_study/, T7):
-	//   max |Mx| ~= 3.83 N*m   (vs 4.06 unconstrained)
-	//   max |My| ~= 0.34 N*m   (vs 0.90 unconstrained -- 2.6x smaller)
-	//   max |Mz| ~= 3.85 N*m   (vs 5.77 unconstrained)
-	// Pitch is the axis that matters: it is produced almost entirely by
-	// the small drag-coupling term, so 0.2 N*m already demands the full
-	// +-0.79 rad fold deflection. Leaving kRateMyLimit at 0.85 let the
-	// rate loop ask for ~2.5x what hover flight can deliver, so the
-	// allocator clamped while the rate loop still believed itself
-	// unsaturated -- exactly the blindness the 2026-09-18 revision was
-	// meant to remove, just at a smaller scale.
-	// The three constants themselves are declared in FoldrotorControl.hpp
-	// so the regression test can see them; this comment is their rationale.
+	// Worth recording why this is more than a refactor. The 2026-09-18
+	// revision and the 2026-09-21 (5) revision were each correcting a
+	// PREDICTED bound against measurement -- once too high (the loop
+	// integrated into a rail it could not see, five reproduced crashes),
+	// once too low (the loop believed itself saturated while authority
+	// remained). Deleting the prediction deletes the class of defect, not
+	// just the two instances of it that were caught.
 
 	// Push into the cascade objects. The *integrator* clamp is a separate
-	// mechanism from setOutputLimits()/conditional integration:
+	// mechanism from the conditional integration that measured saturation
+	// now drives:
 	// FR_VEL_Z_I_LIM/FR_VEL_XY_I_LIM/FR_RATE_R_I_LIM/FR_RATE_P_I_LIM (2026-09-09,
 	// 2026-09-1x, findings.md) bound each loop's accumulated integral
 	// directly. Yaw's rate integrator stays +/-infinity: FR_RATE_YAW_I is
@@ -484,7 +466,7 @@ FoldrotorControl::parameters_updated()
 	_pos_vel_control.setGravityFeedforward(_gains.vel_z_grav_ff);
 	_pos_vel_control.setIntegratorLimit(matrix::Vector3f(_gains.vel_xy_i_lim, _gains.vel_xy_i_lim,
 					    _gains.vel_z_i_lim));
-	_pos_vel_control.setForceLimits(kPosVelForceLimit);
+	_pos_vel_control.setForceLimits(pos_vel_force_limit);
 	_pos_vel_control.setHorizontalForceMargin(kPosVelForceXYMargin);
 	_pos_vel_control.setHorizontalForceLimit(kPosVelForceXYLimit);
 	_pos_vel_control.setVelocityLimits(_gains.vel_xy_max, _gains.vel_z_max_up, _gains.vel_z_max_dn);
@@ -494,15 +476,6 @@ FoldrotorControl::parameters_updated()
 				       _gains.rate_p_ff, _gains.rate_p_i, _gains.rate_p_d,
 				       _gains.rate_yaw_ff, _gains.rate_yaw_i, _gains.rate_yaw_d);
 	_att_rate_control.setIntegratorLimit(matrix::Vector3f(_gains.rate_r_i_lim, _gains.rate_p_i_lim, INFINITY));
-
-	// Seed the output limits with the envelope peaks. ALL THREE axes are
-	// re-scheduled every cycle in Run() against the collective Fz actually
-	// commanded -- these constants are only the peak of a curve that
-	// collapses at both ends, see momentEnvelopeAtThrust() and findings.md
-	// 2026-09-21 (5). This call still matters: it is what the limits are
-	// before the first Run().
-	_att_rate_control.setOutputLimits(matrix::Vector3f(-kRateMxLimit, -kRateMyLimit, -kRateMzLimit),
-					  matrix::Vector3f(kRateMxLimit, kRateMyLimit, kRateMzLimit));
 
 	// SIM_GZ_EC_MIN1/MAX1 -- NOT hardcoded 308/2054 (open item O-5, see
 	// class comment): read here so the airframe file
@@ -581,6 +554,9 @@ FoldrotorControl::Run()
 
 		trajectory_setpoint_s trajectory_setpoint{};
 		_trajectory_setpoint_sub.copy(&trajectory_setpoint);
+
+		vehicle_attitude_setpoint_s attitude_setpoint{};
+		_vehicle_attitude_setpoint_sub.copy(&attitude_setpoint);
 
 		_vehicle_control_mode_sub.copy(&_vehicle_control_mode);
 
@@ -696,32 +672,38 @@ FoldrotorControl::Run()
 				// and produces a NOSE-UP moment,
 				// My_frd = -kS1z * Fx = +0.055 * Fx.
 				//
-				// That closes a POSITIVE FEEDBACK loop through the full
-				// rotation above: pitching nose-up makes the velocity
-				// loop ask for body-forward force in order to keep
-				// pushing up in NED, and that force pitches the vehicle
-				// further nose-up. Loop gain dMy/dtheta = |kS1z| * Fz
-				// ~= 0.055 * 17 = 0.94 N*m/rad against a pitch authority
-				// of ~0.146 N*m, so the level equilibrium is unstable
-				// beyond 0.146/0.94 = 0.155 rad = 8.9 deg. Measured: the
-				// vehicle departed at ~9 deg on every run and ran to a
-				// 73 deg mechanical stop.
+				// PRE-MAST HISTORY, kept because it explains the shape
+				// of this code. When the rotors sat 5.5 cm BELOW the CoM
+				// this closed a POSITIVE FEEDBACK loop: pitching nose-up
+				// made the velocity loop ask for body-forward force to
+				// keep pushing up in NED, and that force pitched the
+				// vehicle further nose-up (+0.94 N*m/rad against ~0.146
+				// N*m of authority -- unstable beyond 8.9 deg, and the
+				// vehicle departed at ~9 deg on every run). The cap was
+				// the fence around that.
+				//
+				// SINCE THE BALLAST MAST (2026-09-22) THE SIGN IS
+				// INVERTED. kS1z is +0.017010: the rotors sit above the
+				// CoM, the coupling is RESTORING at -0.33 N*m/rad, and
+				// body-horizontal force now helps pitch rather than
+				// running away with it. The cap is no longer a stability
+				// fence. What it still does, and what it is now sized
+				// for, is set the tilt at which the vehicle can no longer
+				// keep its lift vertical:
+				//
+				//     theta_max = asin(kBodyForceXYLimit / W)
+				//
+				// At 1.0 N that was 2.9 deg, so any transient past ~3 deg
+				// -- a gust, not just a commanded attitude -- put the
+				// force path on its rail and the vehicle sagged. At 4.0 N
+				// (2026-09-23) it is 11.8 deg. See the constant's own
+				// comment in the header for the measured actuator cost.
 				//
 				// Capping in the INERTIAL frame (kPosVelForceXYLimit)
-				// does not bound this: once tilted, the body-frame
-				// horizontal force is dominated by the rotated
-				// COLLECTIVE (Fx_body = Fz * sin(theta)), not by the
-				// horizontal command. The cap has to be applied here,
-				// after the rotation, where the destabilising moment is
-				// actually set.
-				//
-				// Consequence, stated plainly: this airframe cannot
-				// fully compensate its own attitude in the force path.
-				// While tilted it will not hold altitude, because the
-				// force that would do so is the same force that stops it
-				// ever getting level again. Recovering attitude first
-				// and accepting the altitude error is the only ordering
-				// that converges.
+				// does not do this job: once tilted, the body-frame
+				// horizontal force is dominated by the rotated COLLECTIVE
+				// (Fx_body = Fz * sin(theta)), not by the horizontal
+				// command. It has to be applied here, after the rotation.
 				const float fxy_body = matrix::Vector2f(_F_b(0), _F_b(1)).norm();
 
 				if (fxy_body > kBodyForceXYLimit && fxy_body > FLT_EPSILON) {
@@ -742,16 +724,42 @@ FoldrotorControl::Run()
 
 		// --- Attitude stage (4c's attitude-P half), gated at 250 Hz. ---
 		if (_attitude_gate.due(now)) {
-			// euler_sp: phi_sp/theta_sp pinned to zero (step 4e user
-			// decision -- this vehicle translates by thrust vectoring,
-			// not body lean; findings.md "euler_sp sourcing (step
-			// 4e)"). psi_sp is the only Euler setpoint
-			// TrajectorySetpoint actually carries; NaN means "don't
-			// control yaw" per its own contract, so it holds the
-			// current heading instead of commanding a NaN-derived
-			// moment.
-			const float psi_sp = PX4_ISFINITE(trajectory_setpoint.yaw) ? trajectory_setpoint.yaw : _euler.psi();
-			const matrix::Eulerf euler_sp(0.f, 0.f, psi_sp);
+			// euler_sp: UNPINNED 2026-09-23 (user decision). phi_sp
+			// and theta_sp were fixed at zero since step 4e, on the
+			// grounds that this vehicle translates by thrust vectoring
+			// rather than body lean. That remains true and remains the
+			// DEFAULT -- what changes is that it is no longer the only
+			// option.
+			//
+			// This is the one place in the cascade with no PX4
+			// precedent to copy. mc cannot command attitude
+			// independently of position at all: ControlMath::
+			// thrustToAttitude() builds the attitude setpoint FROM the
+			// thrust vector (body_z = -thr_sp normalised), so two of its
+			// three attitude DOF are consumed pointing the force and
+			// only yaw is a free input. This airframe is fully actuated
+			// and genuinely has all six, so the question "what does a
+			// roll setpoint mean alongside a position setpoint" is
+			// well-posed here and unanswerable there.
+			//
+			// SOURCE PRECEDENCE, and it is a decision, not a derivation:
+			// a live vehicle_attitude_setpoint is authoritative for ALL
+			// THREE angles, not just roll and pitch. An attitude
+			// setpoint is a complete attitude command, and splitting it
+			// -- tilt from here, yaw from trajectory_setpoint -- would
+			// make the commanded attitude depend on which of two
+			// unsynchronised publishers spoke last. NOTE THE
+			// CONSEQUENCE: while an attitude setpoint is live, the yaw
+			// in it overrides trajectory_setpoint.yaw.
+			//
+			// "Live" means published within kAttitudeSetpointTimeout and
+			// carrying a finite quaternion. Otherwise this falls back to
+			// exactly the previous behaviour: level, with psi_sp from
+			// TrajectorySetpoint (NaN there means "don't control yaw"
+			// per its own contract, so hold the current heading rather
+			// than command a NaN-derived moment).
+			const matrix::Eulerf euler_sp =
+				resolveEulerSetpoint(attitude_setpoint, trajectory_setpoint, _euler.psi(), now);
 
 			_att_rate_control.updateAttitude(_euler, euler_sp);
 		}
@@ -759,36 +767,26 @@ FoldrotorControl::Run()
 		// --- Rate stage (4c's rate-PID half), every cycle -- this Run()'s
 		// native ~1000 Hz, driven by vehicle_angular_velocity. ---
 		//
-		// Re-schedule ALL THREE moment limits against the collective
-		// thrust the position loop is asking for THIS cycle, before the
-		// rate loop runs. The kRateM*Limit constants are only the peak of
-		// an envelope that collapses at both ends of the thrust range, so
-		// using them unscheduled both lets the rate loop command moments
-		// the allocator must clamp and blinds the conditional-integration
-		// anti-windup, which keys off these same bounds. Scheduling roll
-		// alone (2026-09-21 (4)) was not enough: pitch and yaw collapse
-		// too once all three are demanded together, which is every cycle.
-		// findings.md 2026-09-21 (5).
+		// NO SCHEDULED OUTPUT LIMIT (2026-09-23). The rate loop used to
+		// be handed momentEnvelopeAtThrust()'s table, re-scheduled every
+		// cycle against collective thrust, which both clamped its output
+		// and supplied its anti-windup predicate. Both are now measured
+		// from the allocator instead -- see the residual computed after
+		// allocate() below, and AttitudeRateControl::setSaturationStatus().
+		// rate_control.cpp does exactly this: no clamp, flags from
+		// control-allocation feedback.
 		//
-		// _F_b is FRD, where Fz is negative-up; momentEnvelopeAtThrust()
-		// takes the magnitude.
-		matrix::Vector3f m_limit = momentEnvelopeAtThrust(_F_b(2));
-
-		// The table was measured with body-x force pinned in reserve, so
-		// its pitch row is the drag-path-only authority (0.342 N*m peak).
-		// The tilt lever below adds |kPitchLeverFxLimit| * 0.0549 N*m on
-		// top of that, and the rate loop has to know: these same bounds
-		// drive the conditional-integration anti-windup, so a limit below
-		// the true ceiling makes the loop believe it is saturated when it
-		// is not -- the mirror image of the 09-18 defect, and just as
-		// blinding. Measured relation is additive to within 1% over the
-		// whole range (max|My| = 0.342 + 0.0549*Fx, checked against the
-		// allocator's own forward map at the actuator box corner:
-		// predicted 1.506, measured 1.490 N*m).
-		m_limit(1) += _param_fr_pitch_lever.get() * kPitchLeverFxLimit
-			      * foldrotor::FoldrotorAllocation::pitchLeverFrd();
-
-		_att_rate_control.setOutputLimits(-m_limit, m_limit);
+		// This also retires the pitch-lever correction that used to be
+		// added to the pitch row here. It existed because the table was
+		// measured with body-x force pinned in reserve and so understated
+		// pitch authority whenever FR_PITCH_LEVER let Fx move; a measured
+		// residual has no such blind spot and needs no correction term.
+		// (That line was also latently sign-wrong post-mast: it added
+		// pitchLeverFrd(), which the ballast mast made NEGATIVE, so it
+		// subtracted from the limit where its comment said it added.
+		// Inert at the shipped FR_PITCH_LEVER = 0. findings.md
+		// 2026-09-23 (15) carried it as an open item; deleting the line
+		// closes it.)
 
 		const matrix::Vector3f rate(angular_velocity.xyz);
 		const matrix::Vector3f rate_dot(angular_velocity.xyz_derivative);
@@ -935,6 +933,48 @@ FoldrotorControl::Run()
 
 		_alloc_out = _allocation.allocate(F_alloc, M_alloc);
 
+		// --- Measured allocator feedback (2026-09-23) ----------------
+		//
+		// PX4's shape, ported: ControlAllocator.cpp:648-657 computes
+		// `unallocated = control_setpoint - allocated_control` and
+		// publishes it; MulticopterRateControl.cpp:199-215 turns the
+		// torque part into per-axis saturation booleans and pushes them
+		// into RateControl::setSaturationStatus(). The only difference
+		// here is that both ends live in one module, so no uORB round
+		// trip is needed -- but the one-cycle delay is kept all the same,
+		// because the flags are set AFTER this cycle's updateRate() has
+		// already run and so take effect on the next one. That is the
+		// same latency PX4 has, arrived at honestly rather than by
+		// accident.
+		//
+		// Why the residual and not _alloc_out.saturated: the flag says
+		// only that SOMETHING clipped, and findings.md 2026-09-22 (12)
+		// measured it reading 0.0% while beta1 sat pinned to its rail,
+		// because fitWrenchToEnvelope() absorbs infeasibility before the
+		// allocator ever sets it. The residual says how much, on which
+		// axis, and with which sign.
+		matrix::Vector3f F_delivered_flu;
+		matrix::Vector3f M_delivered_flu;
+		_allocation.deliveredWrench(_alloc_out, F_delivered_flu, M_delivered_flu);
+
+		// frdToAllocatorFlu() is a 180 deg rotation about x and therefore
+		// its own inverse, so the same call converts the residual back to
+		// the FRD the rate loop works in.
+		const matrix::Vector3f m_resid_frd = frdToAllocatorFlu(M_alloc - M_delivered_flu);
+
+		matrix::Vector3<bool> sat_pos;
+		matrix::Vector3<bool> sat_neg;
+
+		for (int i = 0; i < 3; i++) {
+			// MulticopterRateControl.cpp:205-211's exact test: an
+			// unallocated component means the allocator ran out of
+			// authority in that direction.
+			sat_pos(i) = (m_resid_frd(i) > FLT_EPSILON);
+			sat_neg(i) = (m_resid_frd(i) < -FLT_EPSILON);
+		}
+
+		_att_rate_control.setSaturationStatus(sat_pos, sat_neg);
+
 		// Publish the allocation output for live inspection over MAVLink
 		// (sitl_testing/plot_hover.py), unconditional (armed or not) --
 		// _alloc_out itself is computed unconditionally above, so this
@@ -984,6 +1024,12 @@ FoldrotorControl::Run()
 		debug_array.data[kDebugWrenchMy] = M_alloc(1);
 		debug_array.data[kDebugWrenchMz] = M_alloc(2);
 
+		// Measured residual, FRD -- the travel-based indicator
+		// findings.md 2026-09-22 (12) asked for.
+		debug_array.data[kDebugResidMx] = m_resid_frd(0);
+		debug_array.data[kDebugResidMy] = m_resid_frd(1);
+		debug_array.data[kDebugResidMz] = m_resid_frd(2);
+
 		_debug_array_pub.publish(debug_array);
 
 
@@ -1005,9 +1051,9 @@ FoldrotorControl::Run()
 			}
 
 			const bool is_armed = _vehicle_control_mode.flag_armed;
-			s.m_limit[0] = m_limit(0);
-			s.m_limit[1] = m_limit(1);
-			s.m_limit[2] = m_limit(2);
+			s.m_resid[0] = m_resid_frd(0);
+			s.m_resid[1] = m_resid_frd(1);
+			s.m_resid[2] = m_resid_frd(2);
 			s.saturated = _alloc_out.saturated ? 1 : 0;
 			s.armed = is_armed ? 1 : 0;
 			_trace_head++;
@@ -1107,9 +1153,9 @@ int FoldrotorControl::print_status()
 	PX4_INFO("armed=%d", _vehicle_control_mode.flag_armed);
 	PX4_INFO("F_b = [%.3f, %.3f, %.3f] N (body/FRD)", (double)_F_b(0), (double)_F_b(1), (double)_F_b(2));
 	PX4_INFO("M_b = [%.4f, %.4f, %.4f] N*m (body/FRD)", (double)_M_b(0), (double)_M_b(1), (double)_M_b(2));
-	// Bench-context check (2026-09-14, findings.md): confirms the new
-	// setOutputLimits()/setIntegratorLimit() bounds actually hold each
-	// accumulated integral, not just that the code compiles.
+	// Bench-context check (2026-09-14, findings.md): confirms the
+	// setIntegratorLimit() bounds actually hold each accumulated
+	// integral, not just that the code compiles.
 	const matrix::Vector3f vel_int = _pos_vel_control.getIntegral();
 	const matrix::Vector3f rate_int = _att_rate_control.getIntegral();
 	PX4_INFO("vel_int = [%.4f, %.4f, %.4f] N (inertial/NED; limits +/-%.1f, +/-%.1f, +/-%.1f)",
@@ -1187,14 +1233,14 @@ int FoldrotorControl::custom_command(int argc, char *argv[])
 		const uint32_t count = head < (uint32_t)kTraceLen ? head : (uint32_t)kTraceLen;
 		const uint32_t first = head - count;
 
-		printf("t_us,armed,sat,mx_lim,my_lim,mz_lim,p,q,r,pdot,qdot,rdot,p_sp,q_sp,r_sp,Mx,My,Mz,Fx,Fy,Fz\n");
+		printf("t_us,armed,sat,mx_res,my_res,mz_res,p,q,r,pdot,qdot,rdot,p_sp,q_sp,r_sp,Mx,My,Mz,Fx,Fy,Fz\n");
 
 		for (uint32_t i = 0; i < count; i++) {
 			const TraceSample &s = obj->_trace[(first + i) % kTraceLen];
 			printf("%llu,%u,%u,%.4f,%.4f,%.4f,"
 			       "%.5f,%.5f,%.5f,%.4f,%.4f,%.4f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.4f,%.4f,%.4f\n",
 			       (unsigned long long)s.t, s.armed, s.saturated,
-			       (double)s.m_limit[0], (double)s.m_limit[1], (double)s.m_limit[2],
+			       (double)s.m_resid[0], (double)s.m_resid[1], (double)s.m_resid[2],
 			       (double)s.rate[0], (double)s.rate[1], (double)s.rate[2],
 			       (double)s.rate_dot[0], (double)s.rate_dot[1], (double)s.rate_dot[2],
 			       (double)s.rate_sp[0], (double)s.rate_sp[1], (double)s.rate_sp[2],

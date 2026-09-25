@@ -115,7 +115,7 @@
  *
  * (d) The integrator clamp and the output bounds both default to
  *     +/-infinity because no spec supplies values for them. See
- *     setIntegratorLimit() and setOutputLimits().
+ *     setIntegratorLimit() and setSaturationStatus().
  *
  ****************************************************************************/
 
@@ -165,26 +165,31 @@ public:
 	}
 
 	/**
-	 * Per-axis moment bounds, used both to clamp the returned moment
-	 * and to derive the saturation flags that drive conditional
-	 * integration.
+	 * Per-axis saturation flags driving conditional integration, taken
+	 * from MEASURED allocator feedback. Mirrors
+	 * RateControl::setSaturationStatus() (rate_control.cpp:50-55) exactly,
+	 * and is fed the same way PX4 feeds it: MulticopterRateControl.cpp:
+	 * 199-215 turns the allocator's `unallocated_torque` residual into
+	 * these booleans. 4e does the same with
+	 * FoldrotorAllocation::deliveredWrench().
 	 *
-	 * Defaults to +/-infinity, so both are no-ops. Same reasoning as
-	 * step 4a's PositionVelocityControl::setOutputLimits(): the real
-	 * bounds are a property of what the allocator can produce, which is
-	 * step 4d. This is also exactly how PX4 does it —
-	 * MulticopterRateControl.cpp:196-215 builds its saturation flags
-	 * from control-allocation feedback and pushes them in via
-	 * RateControl::setSaturationStatus() — so deferring is the real
-	 * shape of the problem, not a convenience.
+	 * REPLACES setOutputLimits() (2026-09-23, "do what mc does"). That
+	 * method derived the same flags by comparing the commanded moment
+	 * against momentEnvelopeAtThrust()'s PREDICTED envelope, and this
+	 * class's own comment already recorded that as a deviation from PX4.
+	 * A predicted bound is wrong in both directions: too high and the loop
+	 * integrates into a rail it cannot see (the 2026-09-18 defect), too low
+	 * and it believes itself saturated while authority remains (the
+	 * 2026-09-21 mirror of it). The residual is measured, so it is neither.
 	 *
-	 * Consequence, stated plainly: until 4d/4e pass real bounds, THE
-	 * ANTI-WINDUP IS INERT AT RUNTIME.
+	 * Defaults to all-false, i.e. no conditional integration, which is the
+	 * same inert default the limits carried.
 	 */
-	void setOutputLimits(const matrix::Vector3f &lower, const matrix::Vector3f &upper)
+	void setSaturationStatus(const matrix::Vector3<bool> &saturation_positive,
+				 const matrix::Vector3<bool> &saturation_negative)
 	{
-		_lim_lower = lower;
-		_lim_upper = upper;
+		_sat_pos = saturation_positive;
+		_sat_neg = saturation_negative;
 	}
 
 	/**
@@ -288,19 +293,24 @@ public:
 		const matrix::Vector3f moment =
 			rate_error.emult(_rate_p) + _rate_int - rate_dot.emult(_rate_d);
 
-		matrix::Vector3f moment_limited;
-
-		for (int i = 0; i < 3; i++) {
-			moment_limited(i) = constrain(moment(i), _lim_lower(i), _lim_upper(i));
-		}
+		// NO OUTPUT CLAMP (2026-09-23). rate_control.cpp:71-86 returns the
+		// raw PID moment and bounds nothing; the allocator is the only
+		// authority bound in PX4, and it reports back what it could not
+		// deliver. This class now does the same -- see
+		// setSaturationStatus() -- so the clamp that used to sit here, and
+		// the momentEnvelopeAtThrust() table that fed it, are both gone.
+		// Feasibility is enforced downstream by
+		// FoldrotorControl::fitWrenchToEnvelope(), which is this module's
+		// equivalent of ControlAllocationSequentialDesaturation and is
+		// NOT the table.
 
 		// rate_control.cpp:81-83 — "update integral only if we are not
 		// landed".
 		if (!landed) {
-			updateIntegral(rate_error, moment, dt);
+			updateIntegral(rate_error, dt);
 		}
 
-		return moment_limited;
+		return moment;
 	}
 
 	/**
@@ -338,15 +348,18 @@ private:
 	 *    constant, imported as-is; no spec provides one.
 	 *  - the finiteness guard and integrator clamp (:112-114).
 	 */
-	void updateIntegral(matrix::Vector3f &rate_error, const matrix::Vector3f &moment, float dt)
+	void updateIntegral(matrix::Vector3f &rate_error, float dt)
 	{
 		for (int i = 0; i < 3; i++) {
-			// Saturation flags derived from this step's unclamped
-			// moment. PX4 instead carries them over from the previous
-			// cycle's allocator feedback; using the current step keeps
-			// this class self-contained and matches step 4a.
-			const bool saturated_positive = (moment(i) >= _lim_upper(i));
-			const bool saturated_negative = (moment(i) <= _lim_lower(i));
+			// Saturation flags carried over from the previous cycle's
+			// MEASURED allocator feedback, exactly as PX4 does it
+			// (rate_control.cpp:91-98 reads flags that
+			// MulticopterRateControl.cpp:199-215 set from the allocator's
+			// residual one cycle earlier). Until 2026-09-23 these were
+			// derived in-line from the current step's moment against a
+			// predicted envelope; see setSaturationStatus().
+			const bool saturated_positive = _sat_pos(i);
+			const bool saturated_negative = _sat_neg(i);
 
 			// Prevent further positive/negative control saturation.
 			if (saturated_positive) {
@@ -387,8 +400,8 @@ private:
 	matrix::Vector3f _rate_i;
 	matrix::Vector3f _rate_d;
 
-	matrix::Vector3f _lim_lower{-INFINITY, -INFINITY, -INFINITY};
-	matrix::Vector3f _lim_upper{INFINITY, INFINITY, INFINITY};
+	matrix::Vector3<bool> _sat_pos{};
+	matrix::Vector3<bool> _sat_neg{};
 	matrix::Vector3f _lim_int{INFINITY, INFINITY, INFINITY};
 
 	matrix::Vector3f _rate_sp;
